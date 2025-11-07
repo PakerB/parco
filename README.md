@@ -4,6 +4,8 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-red.svg)](https://opensource.org/licenses/MIT)
 [![HuggingFace Dataset](https://img.shields.io/badge/%F0%9F%A4%97-Dataset-yellow)](https://huggingface.co/ai4co/parco)
 [![HuggingFace Models](https://img.shields.io/badge/%F0%9F%A4%97-Models-yellow)](https://huggingface.co/datasets/ai4co/parco)
+[![Slideslive](https://img.shields.io/badge/SlidesLive-Video-da0f30.svg)](https://recorder-v3.slideslive.com/?share=106087&s=34a9a21f-3f2a-4a4d-9979-98fe9e9d7f33)
+[![Google Slides](https://img.shields.io/badge/Google-Slides-f3b421.svg)](https://docs.google.com/presentation/d/18cM_0-PNgTRatMlrFF9AM9ngMohtqNo85BmN5BoLn14/edit?usp=sharing)
 
 
 <div align="center">
