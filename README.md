@@ -6,6 +6,7 @@
 [![HuggingFace Models](https://img.shields.io/badge/%F0%9F%A4%97-Models-yellow)](https://huggingface.co/datasets/ai4co/parco)
 [![Slideslive](https://img.shields.io/badge/SlidesLive-Video-da0f30.svg)](https://recorder-v3.slideslive.com/?share=106087&s=34a9a21f-3f2a-4a4d-9979-98fe9e9d7f33)
 [![Google Slides](https://img.shields.io/badge/Google-Slides-f3b421.svg)](https://docs.google.com/presentation/d/18cM_0-PNgTRatMlrFF9AM9ngMohtqNo85BmN5BoLn14/edit?usp=sharing)
+[![Slideslive](https://img.shields.io/badge/NeurIPS-Page-674489.svg)](https://neurips.cc/virtual/2025/poster/119562)
 
 
 <div align="center">
