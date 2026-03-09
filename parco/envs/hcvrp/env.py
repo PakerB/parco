@@ -199,7 +199,6 @@ class HCVRPEnv(RL4COEnvBase):
         )
         td.set("action_mask", self.get_action_mask(td))
         return td
-
     @staticmethod
     def get_action_mask(td: TensorDict) -> torch.Tensor:
         batch_size = td.batch_size

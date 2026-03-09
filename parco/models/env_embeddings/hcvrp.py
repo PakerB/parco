@@ -7,7 +7,6 @@ from parco.models.nn.positional_encoder import PositionalEncoder
 
 from .communication import BaseMultiAgentContextEmbedding
 
-
 class HCVRPInitEmbedding(nn.Module):
     """TODO: description
     Note that in HCVRP capacities are not the same for all agents and
