@@ -1,0 +1,210 @@
+PVRPWDPEnv._reset() -> TensorDict (State):
+m: số xe (agent)
+N: số customer
+Mỗi xe có 1 depot -> tổng số node là n+m
+- locs: [B, m+N, 2]     
+- time_window: [B, m+N, 2]  //Để tw của depot là [0, vô cùng] hoặc thay đổi shape
+- demand: [B, m, m+N]   
+- current_node: [B, m]  
+- current_time: [B, m]
+- first_time_pick_up: [B, m]
+- depot_node: [B, m]    
+- current_length: [B,m] 
+- used_capacity: [B, m] 
+- agents_capacity:[B,m] 
+- agents_speed: [B, m]  
+- visited: [B, m+N]     
+- action_mask:[B,m,m+N] 
+- done: [B] 
+
+
+step:
+    - current_time
+    - 
+
+speed, locs, depot, demand, time_window, waitting_time
+
+agent:
+
+td[capacity], td[endurance]
+
+
+def _reset(
+        self, 
+        td: Optional[TensorDict] = None, 
+        batch_size: Optional[list] = None
+    ) -> TensorDict:
+        device = td.device
+
+        # Record parameters
+        # num_agents = self.generator.num_agents
+        # num_loc_all = self.generator.num_loc + num_agents
+        num_agents = td["speed"].size(-1)
+        num_loc_all = td["locs"].size(-2) + num_agents
+
+        # Repeat the depot for each agent (i.e. each agent has its own depot, at the same place)
+        depots = td["depot"]
+        if depots.shape[-2] == 1 or depots.ndim == 2:
+            depots = depots.unsqueeze(-2) if depots.ndim == 2 else depots
+            depots = depots.repeat(1, num_agents, 1)
+
+        # Padding depot demand as 0 to the demand
+        demand_depot = torch.zeros(
+            (*batch_size, num_agents), dtype=torch.float32, device=device
+        )
+        demand = torch.cat((demand_depot, td["demand"]), -1)
+
+        # Repeat the demand for each agent, for convinent action mask calculation
+        # Note that this will take more memory
+        demand = demand.unsqueeze(-2).repeat(1, num_agents, 1)
+
+        speeds = td["speed"]
+        speed_min = speeds.min(dim=-1, keepdim=True)[0]  # [B, 1]
+        
+        # Calculate max_time for depot time window: max(latest_i + travel_time_to_depot_with_min_speed)
+        # Get customer locations and depot location
+        customer_locs = td["locs"]  # [B, N, 2]
+        depot_loc = td["depot"]  # [B, 2] or [B, 1, 2]
+        if depot_loc.ndim == 2:
+            depot_loc = depot_loc.unsqueeze(-2)  # [B, 1, 2]
+        
+        # Calculate distance from each customer to depot [B, N]
+        dist_to_depot = torch.norm(customer_locs - depot_loc, p=2, dim=-1)  # [B, N]
+        
+        # Calculate travel time with minimum speed [B, N]
+        travel_time_to_depot = dist_to_depot / speed_min  # [B, N]
+        
+        # Get latest time windows for customers [B, N]
+        customer_latest = td["time_window"][..., 1]  # [B, N]
+        
+        # Calculate max_time = max(latest_i + travel_time_i) [B, 1]
+        max_time = (customer_latest + travel_time_to_depot).max(dim=-1, keepdim=True)[0]  # [B, 1]
+        
+        # Padding depot time_window as [0, max_time] for each depot
+        # Shape: [B, m, 2] for depots, concat with [B, N, 2] for customers -> [B, m+N, 2]
+        tw_depot = torch.stack([
+            torch.zeros((*batch_size, num_agents), dtype=torch.float32, device=device),  # earliest = 0
+            max_time.expand(-1, num_agents)  # latest = max_time, expand [B, 1] -> [B, m]
+        ], dim=-1)  # [B, m, 2]
+        time_window = torch.cat((tw_depot, td["time_window"]), -2)  # [B, m+N, 2]
+
+        # Padding depot waiting_time as large value (1e6) for each depot
+        # Large value ensures depot allows flexible trip deadlines
+        # Shape: [B, m] for depots, concat with [B, N] for customers -> [B, m+N]
+        waiting_time_depot = torch.full(
+            (*batch_size, num_agents), fill_value=1e6, dtype=torch.float32, device=device
+        )
+        waiting_time = torch.cat((waiting_time_depot, td["waiting_time"]), -1)  # [B, m+N]
+
+        # Init current node
+        depot_node = torch.arange(num_agents, dtype=torch.int64, device=device)[
+            None, ...
+        ].repeat(*batch_size, 1)
+        current_node = depot_node.clone()
+
+        # Init visited
+        visited = torch.zeros((*batch_size, num_loc_all), dtype=torch.bool, device=device)
+
+        # Init action mask
+        action_mask = torch.ones(
+            (*batch_size, num_agents, num_loc_all), dtype=torch.bool, device=device
+        )
+
+        # Create reset TensorDict
+        td_reset = TensorDict(
+            {
+                "locs": torch.cat((depots, td["locs"]), -2),
+                "demand": demand,
+                "time_window": time_window,  # [B, m+N, 2]
+                "waiting_time": waiting_time,  # [B, m+N]
+                "current_length": torch.zeros(
+                    (*batch_size, num_agents), dtype=torch.float32, device=device
+                ),
+                "current_time": torch.zeros(
+                    (*batch_size, num_agents), dtype=torch.float32, device=device
+                ),
+                "trip_deadline": torch.full(
+                    (*batch_size, num_agents), fill_value=1e6, dtype=torch.float32, device=device
+                ),
+                "current_node": current_node,
+                "depot_node": depot_node,
+                "used_capacity": torch.zeros((*batch_size, num_agents), device=device),
+                "used_endurance": torch.zeros((*batch_size, num_agents), device=device),
+                "agents_capacity": td["capacity"],
+                "agents_speed": td["speed"],
+                "agents_endurance": td["endurance"],
+                "i": torch.zeros((*batch_size, 1), dtype=torch.int64, device=device),
+                "visited": visited,
+                "action_mask": action_mask,
+                "done": torch.zeros((*batch_size,), dtype=torch.bool, device=device),
+            },
+            batch_size=batch_size,
+            device=device,
+        )
+        td_reset.set("action_mask", self.get_action_mask(td_reset))
+        return td_reset
+
+
+
+input:
+N - customer 
+M - agents
+hcvrp: 
+    depot       - [B, 2]
+    locs        - [B, N, 2]
+    num_agents  - [B]
+    demand      - [B, N]
+    capacity    - [B, M]
+    speed       - [B, M]
+pvrpwdp:
+    speed 
+    locs
+    depot
+    demand 
+    time_window
+    waiting_time
+    capacity
+    endurance
+
+
+ Node:
+            depot:          [B, 2] 
+            locs:           [B, N, 2]
+            time_window:    [B, N, 2]
+            demand:         [B, N]
+            waiting_time:   [B, N]
+        Veh:
+            speed:          [B, M]
+            capacity:       [B, M]
+            endurance:      [B, M]
+    
+
+    Output Reset TensorDict Shape (after _reset):
+        N: num customer
+        M: num agent
+        N+M: depot + customer 
+
+        Node:
+            locs:               [B, M+N, 2]   # M depot copies + N customer locs
+            demand:             [B, M, M+N]   # Repeated for each agent
+            time_window:        [B, M+N, 2]   # [earliest, latest] for depots and customers
+            waiting_time:       [B, M+N]      # Freshness time for depots and customers
+        
+        Agent State:
+            current_length:     [B, M]        # Total distance traveled by each agent
+            current_time:       [B, M]        # Current time of each agent
+            current_node:       [B, M]        # Current node index (0..M-1 = depots, M..M+N-1 = customers)
+            trip_deadline:      [B, M]        # Deadline to return to depot (freshness constraint)
+            depot_node:         [B, M]        # Home depot index for each agent
+            used_capacity:      [B, M]        # Accumulated pickup from customers
+            used_endurance:     [B, M]        # Accumulated battery/endurance used
+            agents_capacity:    [B, M]        # Max capacity of each agent
+            agents_speed:       [B, M]        # Speed of each agent
+            agents_endurance:   [B, M]        # Max endurance/battery of each agent
+            
+        Tracking:
+            i:                  [B, 1]        # Step counter
+            visited:            [B, M+N]      # Boolean mask of visited nodes
+            action_mask:        [B, M, M+N]   # Valid actions for each agent
+            done:               [B]           # Episode completion flag
+    """

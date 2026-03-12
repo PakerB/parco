@@ -2,17 +2,18 @@ from typing import Optional
 
 import torch
 
-from rl4co.envs.common.base import RL4COEnvBase
 from rl4co.utils.ops import gather_by_index, get_distance
 from rl4co.utils.pylogger import get_pylogger
 from tensordict.tensordict import TensorDict
 from torchrl.data import Bounded, Composite, Unbounded
 
+from parco.envs.epoch_data_env_base import EpochDataEnvBase
+from parco.envs.pvrpwdp.generator import PVRPWDPGenerator
 
 
 log = get_pylogger(__name__)
 
-class PVRPWDPVEnv(RL4COEnvBase):
+class PVRPWDPVEnv(EpochDataEnvBase):
     """Perishable Vehicle Routing Problem with Drones and Pickup (PVRPWDP) environment.
     
     PVRPWDP extends HCVRP with time windows and perishability constraints for pickup operations.
@@ -65,68 +66,79 @@ class PVRPWDPVEnv(RL4COEnvBase):
         generator: An instance of PVRPWDPGenerator for generating problem instances
         generator_params: Parameters configuring the generator (num_loc, time windows, freshness, etc.)
         check_solution: Enable solution validation for debugging (slows down training)
+
+    Input TensorDict Shape (from Generator):
+        N: num customer
+        M: num agent
+
+        Node:
+            depot:          [B, 2] 
+            locs:           [B, N, 2]
+            time_window:    [B, N, 2]
+            demand:         [B, N]
+            waiting_time:   [B, N]
+        Veh:
+            speed:          [B, M]
+            capacity:       [B, M]
+            endurance:      [B, M]
+    
+    Output Reset TensorDict Shape (after _reset):
+        N: num customer
+        M: num agent
+        N+M: depot + customer 
+
+        Node:
+            locs:               [B, M+N, 2]   # M depot copies + N customer locs
+            demand:             [B, M, M+N]   # Repeated for each agent
+            time_window:        [B, M+N, 2]   # [earliest, latest] for depots and customers
+            waiting_time:       [B, M+N]      # Freshness time for depots and customers
+        
+        Agent State:
+            current_length:     [B, M]        # Total distance traveled by each agent
+            current_time:       [B, M]        # Current time of each agent
+            current_node:       [B, M]        # Current node index (0..M-1 = depots, M..M+N-1 = customers)
+            trip_deadline:      [B, M]        # Deadline to return to depot (freshness constraint)
+            depot_node:         [B, M]        # Home depot index for each agent
+            used_capacity:      [B, M]        # Accumulated pickup from customers
+            used_endurance:     [B, M]        # Accumulated battery/endurance used
+            agents_capacity:    [B, M]        # Max capacity of each agent
+            agents_speed:       [B, M]        # Speed of each agent
+            agents_endurance:   [B, M]        # Max endurance/battery of each agent
+            
+        Tracking:
+            i:                  [B, 1]        # Step counter
+            visited:            [B, M+N]      # Boolean mask of visited nodes
+            action_mask:        [B, M, M+N]   # Valid actions for each agent
+            done:               [B]           # Episode completion flag
     """
     
     name = "pvrpwdp"
     
     def __init__(
         self,
-        generator: PVRPWDPGenerator = None,
+        generator: PVRPWDPGenerator | None = None,
         generator_params: dict = {},
         check_solution: bool = False,
+        epoch_data_dir: str | None = None,
+        epoch_file_pattern: str = "epoch_{epoch}.npz",
+        use_epoch_data: bool = True,
+        fallback_to_generator: bool = True,
         **kwargs,
     ):
-        super().__init__(**kwargs)
-
         if generator is None:
             generator = PVRPWDPGenerator(**generator_params)
         self.generator = generator
+        
+        super().__init__(
+            epoch_data_dir=epoch_data_dir,
+            epoch_file_pattern=epoch_file_pattern,
+            use_epoch_data=use_epoch_data,
+            fallback_to_generator=fallback_to_generator,
+            **kwargs
+        )
 
         self._make_spec(self.generator)
-    
-    def dataset(self, batch_size=[], phase="train", filename=None):
-        if filename is not None:
-            log.info(f"Overriding dataset filename from {filename}")
-        f = getattr(self, f"{phase}_file") if filename is None else filename
-        if f is None:
-            if phase != "train":
-                log.warning(f"{phase}_file not set. Generating dataset instead")
-            td = self.generator(
-                batch_size,
-                current_epoch=self.current_epoch,
-                max_epochs=self.max_epochs
-            )
-        else:
-            log.info(f"Loading {phase} dataset from {f}")
-            if phase == "train":
-                log.warning(
-                    "Loading training dataset from file. This may not be desired in RL since "
-                    "the dataset is fixed and the agent will not be able to explore new states"
-                )
-            try:
-                from collections.abc import Iterable
-                if isinstance(f, Iterable) and not isinstance(f, str):
-                    names = getattr(self, f"{phase}_dataloader_names")
-                    return {
-                        name: self.dataset_cls(self.load_data(_f, batch_size))
-                        for name, _f in zip(names, f)
-                    }
-                else:
-                    td = self.load_data(f, batch_size)
-            except FileNotFoundError:
-                log.error(
-                    f"Provided file name {f} not found. Make sure to provide a file in the right path first or "
-                    f"unset {phase}_file to generate data automatically instead"
-                )
-                td = self.generator(
-                    batch_size,
-                    current_epoch=self.current_epoch,
-                    max_epochs=self.max_epochs
-                )
 
-        return self.dataset_cls(td)
-
-    
     def _reset(
         self, 
         td: Optional[TensorDict] = None, 
@@ -156,11 +168,34 @@ class PVRPWDPVEnv(RL4COEnvBase):
         # Note that this will take more memory
         demand = demand.unsqueeze(-2).repeat(1, num_agents, 1)
 
-        # Padding depot time_window as [0, 0] for each depot
+        speeds = td["speed"]
+        speed_min = speeds.min(dim=-1, keepdim=True)[0]  # [B, 1]
+        
+        # Calculate max_time for depot time window: max(latest_i + travel_time_to_depot_with_min_speed)
+        # Get customer locations and depot location
+        customer_locs = td["locs"]  # [B, N, 2]
+        depot_loc = td["depot"]  # [B, 2] or [B, 1, 2]
+        if depot_loc.ndim == 2:
+            depot_loc = depot_loc.unsqueeze(-2)  # [B, 1, 2]
+        
+        # Calculate distance from each customer to depot [B, N]
+        dist_to_depot = torch.norm(customer_locs - depot_loc, p=2, dim=-1)  # [B, N]
+        
+        # Calculate travel time with minimum speed [B, N]
+        travel_time_to_depot = dist_to_depot / speed_min  # [B, N]
+        
+        # Get latest time windows for customers [B, N]
+        customer_latest = td["time_window"][..., 1]  # [B, N]
+        
+        # Calculate max_time = max(latest_i + travel_time_i) [B, 1]
+        max_time = (customer_latest + travel_time_to_depot).max(dim=-1, keepdim=True)[0]  # [B, 1]
+        
+        # Padding depot time_window as [0, max_time] for each depot
         # Shape: [B, m, 2] for depots, concat with [B, N, 2] for customers -> [B, m+N, 2]
-        tw_depot = torch.zeros(
-            (*batch_size, num_agents, 2), dtype=torch.float32, device=device
-        )
+        tw_depot = torch.stack([
+            torch.zeros((*batch_size, num_agents), dtype=torch.float32, device=device),  # earliest = 0
+            max_time.expand(-1, num_agents)  # latest = max_time, expand [B, 1] -> [B, m]
+        ], dim=-1)  # [B, m, 2]
         time_window = torch.cat((tw_depot, td["time_window"]), -2)  # [B, m+N, 2]
 
         # Padding depot waiting_time as large value (1e6) for each depot
