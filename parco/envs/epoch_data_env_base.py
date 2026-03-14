@@ -177,19 +177,28 @@ class EpochDataEnvBase(RL4COEnvBase):
             td = load_npz_to_tensordict(file_path)
             
             # Validate batch size if specified
-            if batch_size and td.batch_size[0] != batch_size[0]:
-                log.warning(
-                    f"Loaded data batch size {td.batch_size[0]} does not match "
-                    f"requested batch size {batch_size[0]}. Using loaded size."
-                )
+            if batch_size:
+                # Handle both int and list batch_size
+                expected_batch = batch_size[0] if isinstance(batch_size, (list, tuple)) else batch_size
+                actual_batch = td.batch_size[0]
+                
+                if actual_batch != expected_batch:
+                    log.warning(
+                        f"Loaded data batch size {actual_batch} does not match "
+                        f"requested batch size {expected_batch}. Using loaded size."
+                    )
             
             return td
             
         except Exception as e:
+            import traceback
             log.error(
-                f"Error loading epoch file '{file_path}': {str(e)}. "
-                f"Falling back to generator."
+                f"Error loading epoch file '{file_path}': {str(e)}\n"
+                f"Full traceback:\n{traceback.format_exc()}"
             )
+            if not self.fallback_to_generator:
+                # Re-raise exception if fallback disabled for better debugging
+                raise
             return None
     
     def dataset(self, batch_size=[], phase="train", filename=None):

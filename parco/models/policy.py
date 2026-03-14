@@ -132,7 +132,7 @@ class PARCOPolicy(nn.Module):
         return_actions: bool = True,
         return_sum_log_likelihood: bool = True,
         actions=None,
-        max_steps=1_000_000,
+        max_steps=500,  # PVRPWDP with 20 customers + 4 agents needs ~80-100 steps max; 500 = safe margin
         return_init_embeds: bool = True,
         **decoding_kwargs,
     ) -> dict:
@@ -197,6 +197,69 @@ class PARCOPolicy(nn.Module):
                 log.error(
                     f"Exceeded maximum number of steps ({max_steps}) during decoding"
                 )
+                # Debug output when hitting max_steps
+                log.error("=" * 80)
+                log.error("DEBUG INFO AT MAX_STEPS EXCEEDED")
+                log.error("=" * 80)
+                
+                # Get the first batch element and first agent for detailed analysis
+                batch_idx = 0
+                
+                # State information
+                log.error(f"\nBatch index: {batch_idx}")
+                log.error(f"Number of agents: {num_agents}")
+                log.error(f"Current done status: {td['done'][batch_idx]}")
+                log.error(f"Step reached: {step}")
+                
+                # Current node status for all agents
+                log.error(f"\nCurrent node (all agents):")
+                log.error(f"  {td['current_node'][batch_idx]}")
+                
+                # Previous action if available
+                if "previous_action" in td:
+                    log.error(f"\nPrevious action (all agents):")
+                    log.error(f"  {td['previous_action'][batch_idx]}")
+                
+                # Action mask detailed analysis (first agent)
+                action_mask = td["action_mask"][batch_idx]  # [num_agents, num_nodes]
+                log.error(f"\nAction mask shape: {action_mask.shape}")
+                log.error(f"Action mask for first agent (valid actions per node):")
+                for agent_idx in range(min(num_agents, 2)):  # Show first 2 agents
+                    valid_count = action_mask[agent_idx].sum().item()
+                    valid_actions = torch.where(action_mask[agent_idx])[0].tolist()
+                    log.error(f"  Agent {agent_idx}: {valid_count} valid nodes -> {valid_actions[:10]}{'...' if len(valid_actions) > 10 else ''}")
+                
+                # Detailed constraints breakdown for first agent
+                if hasattr(env, 'get_action_mask'):
+                    log.error(f"\nDetailed constraint analysis for agent 0:")
+                    # We'll call the environment's action mask function components
+                    visited = td.get("visited", None)
+                    if visited is not None:
+                        log.error(f"  Visited nodes: {visited[batch_idx][0].sum().item()} out of {visited.shape[-1]}")
+                    
+                    capacity = td.get("vehicle_capacity_left", None)
+                    if capacity is not None:
+                        log.error(f"  Capacity left: {capacity[batch_idx, 0]:.2f}")
+                    
+                    time_left = td.get("time_left", None)
+                    if time_left is not None:
+                        log.error(f"  Time left: {time_left[batch_idx, 0]:.2f}")
+                    
+                    slack_time = td.get("slack_time", None)
+                    if slack_time is not None:
+                        log.error(f"  Slack time: {slack_time[batch_idx, 0]:.2f}")
+                    
+                    trip_deadline = td.get("trip_deadline_reached", None)
+                    if trip_deadline is not None:
+                        log.error(f"  Trip deadline reached: {trip_deadline[batch_idx, 0].item()}")
+                    
+                    depot_fixed = td.get("done_agents", None)
+                    if depot_fixed is not None:
+                        log.error(f"  Done agents: {depot_fixed[batch_idx]}")
+                
+                # Sample the full td for batch 0, agent 0
+                log.error(f"\nFull TensorDict keys available in td")
+                log.error("=" * 80)
                 break
 
         # Post-decoding hook: used for the final step(s) of the decoding strategy

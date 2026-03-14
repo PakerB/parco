@@ -149,7 +149,7 @@ class PVRPWDPVEnv(EpochDataEnvBase):
         # Record parameters
         # num_agents = self.generator.num_agents
         # num_loc_all = self.generator.num_loc + num_agents
-        num_agents = td["speed"].size(-1)
+        num_agents = td["agents_speed"].size(-1)
         num_loc_all = td["locs"].size(-2) + num_agents
 
         # Repeat the depot for each agent (i.e. each agent has its own depot, at the same place)
@@ -168,7 +168,7 @@ class PVRPWDPVEnv(EpochDataEnvBase):
         # Note that this will take more memory
         demand = demand.unsqueeze(-2).repeat(1, num_agents, 1)
 
-        speeds = td["speed"]
+        speeds = td["agents_speed"]
         speed_min = speeds.min(dim=-1, keepdim=True)[0]  # [B, 1]
         
         # Calculate max_time for depot time window: max(latest_i + travel_time_to_depot_with_min_speed)
@@ -185,7 +185,7 @@ class PVRPWDPVEnv(EpochDataEnvBase):
         travel_time_to_depot = dist_to_depot / speed_min  # [B, N]
         
         # Get latest time windows for customers [B, N]
-        customer_latest = td["time_window"][..., 1]  # [B, N]
+        customer_latest = td["time_windows"][..., 1]  # [B, N]
         
         # Calculate max_time = max(latest_i + travel_time_i) [B, 1]
         max_time = (customer_latest + travel_time_to_depot).max(dim=-1, keepdim=True)[0]  # [B, 1]
@@ -196,14 +196,12 @@ class PVRPWDPVEnv(EpochDataEnvBase):
             torch.zeros((*batch_size, num_agents), dtype=torch.float32, device=device),  # earliest = 0
             max_time.expand(-1, num_agents)  # latest = max_time, expand [B, 1] -> [B, m]
         ], dim=-1)  # [B, m, 2]
-        time_window = torch.cat((tw_depot, td["time_window"]), -2)  # [B, m+N, 2]
+        time_window = torch.cat((tw_depot, td["time_windows"]), -2)  # [B, m+N, 2]
 
-        # Padding depot waiting_time as large value (1e6) for each depot
-        # Large value ensures depot allows flexible trip deadlines
+        # Padding depot waiting_time as max_time for each depot
+        # Use max_time (consistent with truck endurance and time_scaler)
         # Shape: [B, m] for depots, concat with [B, N] for customers -> [B, m+N]
-        waiting_time_depot = torch.full(
-            (*batch_size, num_agents), fill_value=1e6, dtype=torch.float32, device=device
-        )
+        waiting_time_depot = max_time.expand(-1, num_agents)  # [B, m]
         waiting_time = torch.cat((waiting_time_depot, td["waiting_time"]), -1)  # [B, m+N]
 
         # Init current node
@@ -233,16 +231,16 @@ class PVRPWDPVEnv(EpochDataEnvBase):
                 "current_time": torch.zeros(
                     (*batch_size, num_agents), dtype=torch.float32, device=device
                 ),
-                "trip_deadline": torch.full(
-                    (*batch_size, num_agents), fill_value=1e6, dtype=torch.float32, device=device
-                ),
+                "trip_deadline": max_time.expand(-1, num_agents),  # [B, m] - use max_time instead of 1e6
+                "max_time": max_time.squeeze(-1),  # [B] - store for resetting trip_deadline in _step
                 "current_node": current_node,
+                "previous_action": current_node.clone(),  # [B, m] - track previous action for stuck detection
                 "depot_node": depot_node,
                 "used_capacity": torch.zeros((*batch_size, num_agents), device=device),
                 "used_endurance": torch.zeros((*batch_size, num_agents), device=device),
-                "agents_capacity": td["capacity"],
-                "agents_speed": td["speed"],
-                "agents_endurance": td["endurance"],
+                "agents_capacity": td["agents_capacity"],
+                "agents_speed": td["agents_speed"],
+                "agents_endurance": td["agents_endurance"],
                 "i": torch.zeros((*batch_size, 1), dtype=torch.int64, device=device),
                 "visited": visited,
                 "action_mask": action_mask,
@@ -333,9 +331,14 @@ class PVRPWDPVEnv(EpochDataEnvBase):
             trip_deadline_updated  # Move: use updated deadline
         )
         
-        # Reset trip_deadline when going back to depot
-        trip_deadline = trip_deadline * (td["action"] >= num_agents).float() + \
-                       (1e6) * (td["action"] < num_agents).float()
+        # Reset trip_deadline to max_time when going back to depot
+        # Use max_time from td instead of hardcoded 1e6
+        max_time_expanded = td["max_time"].unsqueeze(-1).expand_as(trip_deadline)  # [B, m]
+        trip_deadline = torch.where(
+            td["action"] < num_agents,  # If going to depot
+            max_time_expanded,  # Reset to max_time
+            trip_deadline  # Otherwise keep current deadline
+        )
         
 
         # Note: here we do not subtract one as we have to scatter so the first column allows scattering depot
@@ -343,7 +346,9 @@ class PVRPWDPVEnv(EpochDataEnvBase):
         visited = td["visited"].scatter(-1, td["action"], 1)
 
         # update the done and reward
-        done = visited[..., num_agents:].sum(-1) == (visited.size(-1) - num_agents)
+        # Done condition 1: all customers visited
+        all_visited = visited[..., num_agents:].sum(-1) == (visited.size(-1) - num_agents)
+        done = all_visited
         reward = torch.zeros_like(done)
 
         td.update(
@@ -352,6 +357,7 @@ class PVRPWDPVEnv(EpochDataEnvBase):
                 "current_time": current_time,
                 "trip_deadline": trip_deadline,
                 "current_node": td["action"],
+                "previous_action": td["action"].clone(),  # Store action for next step's stuck detection
                 "used_capacity": used_capacity,
                 "used_endurance": used_endurance,
                 "i": td["i"] + 1,
@@ -361,41 +367,101 @@ class PVRPWDPVEnv(EpochDataEnvBase):
             }
         )
         td.set("action_mask", self.get_action_mask(td))
+
+        # === Impossibility Detection ===
+        # Check if all agents are at depot with no valid customer action
+        # This should not happen if data is feasible, but we detect it for safety
+        impossible = self._check_impossibility(td, num_agents)
+        if impossible.any():
+            # log.warning("="*80)
+            # log.warning("IMPOSSIBILITY DETECTED - Setting done=True")
+            # log.warning("="*80)
+            # batch_size = td.batch_size[0] if isinstance(td.batch_size, (list, tuple)) else 1
+            # for b in range(batch_size):
+            #     if impossible[b]:
+            #         visited_count = td["visited"][b, num_agents:].sum().item()
+            #         total_customers = td["visited"].shape[-1] - num_agents
+            #         log.warning(
+            #             f"  Batch {b}: All agents at depot, no customer reachable. "
+            #             f"Visited {visited_count}/{total_customers} customers"
+            #         )
+            
+            # Set done for impossible batches
+            if td["done"].dim() > 1:
+                td["done"] = td["done"] | impossible.unsqueeze(-1)
+            else:
+                td["done"] = td["done"] | impossible
+
+        # Done condition 2: no agent can reach any unvisited customer
+        # (all agents only have depot as valid action)
+        # Must check AFTER action_mask is updated
+        action_mask = td["action_mask"]
+        has_customer_action = action_mask[..., num_agents:].any(dim=-1)  # [B, m] per agent
+        any_agent_can_reach_customer = has_customer_action.any(dim=-1)   # [B] any agent
+        no_progress_possible = ~any_agent_can_reach_customer & ~td["done"].squeeze(-1)
+        if no_progress_possible.any():
+            td["done"] = td["done"] | no_progress_possible.unsqueeze(-1)
         return td
+    
+    def _check_impossibility(self, td: TensorDict, num_agents: int) -> torch.Tensor:
+        """
+        Detect if problem is impossible to continue.
+        
+        Condition: All agents at depot + no valid customer action for any agent + not done yet
+        
+        Returns: [B] boolean tensor - True if impossible
+        """
+        # Check if all agents are at depot
+        agent_at_depot = td["current_node"] < num_agents  # [B, m]
+        all_at_depot = agent_at_depot.all(dim=-1)  # [B]
+        
+        # Check if any agent has valid customer action
+        action_mask = td["action_mask"]  # [B, m, m+N]
+        customer_actions = action_mask[..., num_agents:]  # [B, m, N]
+        has_customer_action = customer_actions.any(dim=-1)  # [B, m]
+        any_agent_can_reach = has_customer_action.any(dim=-1)  # [B]
+        
+        # Impossible = all at depot + no agent can reach customer + not done
+        done = td["done"].squeeze(-1) if td["done"].dim() > 1 else td["done"]  # [B]
+        impossible = all_at_depot & ~any_agent_can_reach & ~done
+        
+        return impossible
     
     def _get_reward(self, td: TensorDict, actions: torch.Tensor) -> torch.Tensor:
         """
-        Compute reward for PVRPWDP V2.
+        Compute reward for PVRPWDP.
         
-        Lexicographic reward with 2 priorities:
-        1. Feasibility: Visit all customers (hard constraint)
-        2. Efficiency: Minimize makespan (soft optimization)
+        Cost = alpha * (makespan / max_time) + beta * (unvisited / total_customers)
         
-        Note: Removed vehicle usage penalty to allow model to use as many vehicles as needed
+        Where:
+            - makespan = max(current_time of all agents) = thời gian về depot muộn nhất
+            - max_time = thời gian tối đa của bài toán (dùng để chuẩn hóa)
+            - unvisited = số khách chưa thăm
+            - total_customers = tổng số khách
+            - alpha = 10 (trọng số makespan)
+            - beta = 1 (trọng số unvisited)
+        
+        Reward = -cost (RL4CO convention: maximize reward = minimize cost)
         """
-        # Customers visited / unvisited
-        num_customers = td["visited"].shape[-1] - 1
-        visited_count = td["visited"][:, 1:].sum(dim=-1).float()
-        unvisited_count = num_customers - visited_count
-        has_unvisited = (unvisited_count > 0).float()   # 1 if there are unvisited customers
+        alpha = 0.0
+        beta = 20.0
         
-        # System metrics
-        makespan = td["time_per_vehicle"].max(dim=-1)[0]   # Time to complete all trips
+        num_agents = td["current_node"].size(-1)
+        num_customers = td["visited"].shape[-1] - num_agents  # total locations - depot slots
         
-        # Reward parameters
-        # HARD = self.generator.T0 * self.generator.num_loc   # Hard penalty for infeasibility
-        # SOFT = self.generator.T0                            # Soft penalty per unvisited customer
-        HARD = 5
-        SOFT = 1
-        # LEXICOGRAPHIC COST
-        # Case 1: Infeasible (has unvisited customers)
-        cost_unvisited = HARD + SOFT * unvisited_count
+        # Makespan: thời gian về depot muộn nhất trong các agent
+        makespan = td["current_time"].max(dim=-1)[0]  # [B]
         
-        # Case 2: Feasible (all customers visited) - Only minimize makespan
-        cost_feasible = makespan
+        # Chuẩn hóa makespan bởi max_time
+        max_time = td["max_time"]  # [B]
+        makespan_normalized = makespan / max_time  # [B], trong khoảng [0, 1+]
         
-        # Select cost based on feasibility
-        cost = has_unvisited * cost_unvisited + (1.0 - has_unvisited) * cost_feasible
+        # Số khách không thăm được (chỉ đếm customer, bỏ depot slots)
+        unvisited_count = (~td["visited"][..., num_agents:]).sum(dim=-1).float()  # [B]
+        unvisited_ratio = unvisited_count / num_customers  # [B], trong khoảng [0, 1]
+        
+        # Cost = alpha * (makespan / max_time) + beta * (unvisited / total)
+        cost = alpha * makespan_normalized + beta * unvisited_ratio
         
         # Reward = -cost
         return -cost
@@ -526,6 +592,33 @@ class PVRPWDPVEnv(EpochDataEnvBase):
         within_endurance = within_endurance | ~customer_mask
         action_mask &= within_endurance
         
+        # === Stuck state detection: If action will repeat, force progression ===
+        # Check if action will be the same as current_node (all agents stuck)
+        # For agents ngoài depot, mask out current_node to force them toward depot
+        if "previous_action" in td.keys():
+            action_will_repeat = td["current_node"] == td["previous_action"]  # [B, m]
+            
+            if action_will_repeat.any():
+                # Agents NOT at depot + action will repeat → force them to move
+                # Block their current_node from action_mask so next step must choose depot
+                is_at_depot = td["current_node"] < num_agents  # [B, m]
+                should_block_current = action_will_repeat & ~is_at_depot  # [B, m]
+                
+                if should_block_current.any():
+                    # Vectorized: Create mask to block current_node
+                    # For affected agents, set their current_node action to False
+                    block_mask = torch.zeros_like(action_mask, dtype=torch.bool)  # [B, m, m+N]
+                    
+                    # Scatter ones at positions where should block current_node
+                    for b in range(batch_size[0]):
+                        for m_idx in range(num_agents):
+                            if should_block_current[b, m_idx]:
+                                current_idx = td["current_node"][b, m_idx].item()
+                                block_mask[b, m_idx, current_idx] = True
+                    
+                    # Apply block: set these positions to False
+                    action_mask = action_mask & ~block_mask
+        
         # === Original depot isolation logic ===
         # The depot is not available if **all** the agents are at the depot and the task is not finished
         all_back_flag = torch.sum(td["current_node"] >= num_agents, dim=-1) == 0
@@ -544,6 +637,26 @@ class PVRPWDPVEnv(EpochDataEnvBase):
         eye_matrix = eye_matrix[None, ...].repeat(*batch_size, 1, 1).bool()
         eye_matrix &= depot_mask[..., None]
         action_mask[..., :num_agents] = eye_matrix
+
+        # === Safety net: ensure each agent always has at least one valid action ===
+        # If an agent has NO valid action (all customers and depot masked), allow its depot.
+        # This prevents action_mask from being entirely False, which would cause crashes.
+        # Note: Data is guaranteed to be feasible, so this should rarely trigger.
+        # If it does, impossibility detection in _step() will catch it and set done=True.
+        no_valid_action = ~action_mask.any(dim=-1)  # [B, m] - True if agent has no valid action
+        if no_valid_action.any():
+            # For each agent with no valid action, allow only its depot
+            depot_fix = torch.zeros_like(action_mask)  # [B, m, m+N]
+            depot_eye = torch.eye(num_agents, device=td.device).bool()
+            depot_eye = depot_eye[None, ...].repeat(*batch_size, 1, 1)  # [B, m, m]
+            # Pad to full action space: [B, m, m] -> [B, m, m+N]
+            depot_fix[..., :num_agents] = depot_eye
+            # Replace mask for affected agents (allow only their depot)
+            action_mask = torch.where(
+                no_valid_action.unsqueeze(-1),  # [B, m, 1] - agents with no valid action
+                depot_fix,                        # [B, m, m+N] - allow only their depot
+                action_mask                       # [B, m, m+N] - keep existing mask
+            )
 
         return action_mask
 

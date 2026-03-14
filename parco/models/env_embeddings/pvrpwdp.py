@@ -62,9 +62,9 @@ class PVRPWDPInitEmbedding(nn.Module):
 
         # Compute dynamic scalers from data
         demands = td["demand"][..., 0, num_agents:]  # [B, N]
-        capacities = td["capacity"]  # [B, m]
-        speeds = td["speed"]  # [B, m]
-        endurances = td["endurance"]  # [B, m]
+        capacities = td["agents_capacity"]  # [B, m]
+        speeds = td["agents_speed"]  # [B, m]
+        endurances = td["agents_endurance"]  # [B, m]
         time_windows = td["time_window"][..., num_agents:, :]  # [B, N, 2]
         
         # demand_scaler = max(all demands, all capacities)
@@ -84,20 +84,35 @@ class PVRPWDPInitEmbedding(nn.Module):
             endurance_scaler = endurances.max(dim=-1, keepdim=True)[0].unsqueeze(-1)  # [B, 1, 1]
         else:
             endurance_scaler = time_scaler  # Use time_scaler for endurance normalization
+        
+        # Compute distance scaler from actual coordinates (for normalizing spatial features)
+        # Use max distance from depot to any location
+        all_locs = td["locs"]  # [B, M+N, 2]
+        depot_loc = depot_locs[..., 0:1, :]  # [B, 1, 2] - first agent's depot
+        distances = torch.norm(all_locs - depot_loc, p=2, dim=-1, keepdim=True)  # [B, M+N, 1]
+        distance_scaler = distances.max(dim=-2, keepdim=True)[0]  # [B, 1, 1]
+        # Avoid division by zero
+        distance_scaler = torch.where(
+            distance_scaler > 1e-6,
+            distance_scaler,
+            torch.ones_like(distance_scaler)
+        )
 
-        # Depots embedding with positional encoding
-        depots_embedding = self.init_embed_depot(depot_locs)
+        # Depots embedding with positional encoding (normalize by distance scaler)
+        depot_locs_normalized = depot_locs / distance_scaler  # [B, 1, 1] broadcasts to [B, M, 2]
+        depots_embedding = self.init_embed_depot(depot_locs_normalized)
         pos_embedding = self.pos_encoder(depots_embedding, add=False)
         pos_embedding = self.alpha * self.pos_embedding_proj(pos_embedding)
         depot_embedding = depots_embedding + pos_embedding
 
-        # Agents embedding
+        # Agents embedding (normalize coordinates by distance scaler)
+        agents_locs_normalized = agents_locs / distance_scaler  # [B, 1, 1] broadcasts to [B, M, 2]
         agents_feats = torch.cat(
             [
-                agents_locs,
-                td["capacity"][..., None] / demand_scaler,
-                td["speed"][..., None] / speed_scaler,
-                td["endurance"][..., None] / endurance_scaler,
+                agents_locs_normalized,
+                td["agents_capacity"][..., None] / demand_scaler,
+                td["agents_speed"][..., None] / speed_scaler,
+                td["agents_endurance"][..., None] / endurance_scaler,
             ],
             dim=-1,
         )
@@ -110,11 +125,14 @@ class PVRPWDPInitEmbedding(nn.Module):
         # Clients embedding
         earliest = time_windows[..., 0]  # [B, N]
         latest = time_windows[..., 1]    # [B, N]
-        waiting_times = td["waiting_time"][num_agents:]  # [B, N] - only customer waiting times
+        waiting_times = td["waiting_time"][..., num_agents:]  # [B, N] - only customer waiting times (slice on last dim)
+        
+        # Normalize client locations by distance scaler (NOT min-max)
+        clients_locs_normalized = clients_locs / distance_scaler  # [B, 1, 1] broadcasts to [B, N, 2]
         
         clients_feats = torch.cat(
             [
-                clients_locs,                          # [B, N, 2]
+                clients_locs_normalized,               # [B, N, 2] - normalized by distance!
                 demands[..., None] / demand_scaler,    # [B, N, 1]
                 earliest[..., None] / time_scaler,     # [B, N, 1]
                 latest[..., None] / time_scaler,       # [B, N, 1]
@@ -124,15 +142,22 @@ class PVRPWDPInitEmbedding(nn.Module):
         )  # [B, N, 6]
 
         if self.use_polar_feats:
-            # Convert to polar coordinates
-            depot = depot_locs[..., 0:1, :]
-            client_locs_centered = clients_locs - depot  # centering
-            dist_to_depot = torch.norm(client_locs_centered, p=2, dim=-1, keepdim=True)
+            # Convert to polar coordinates using ACTUAL (unnormalized) coordinates
+            # This preserves the physical meaning of distance and angle
+            depot_actual = depot_locs[..., 0:1, :]  # [B, 1, 2]
+            client_locs_centered = clients_locs - depot_actual  # [B, N, 2]
+            
+            # Compute distance and normalize by distance_scaler
+            dist_to_depot = torch.norm(client_locs_centered, p=2, dim=-1, keepdim=True)  # [B, N, 1]
+            dist_to_depot_normalized = dist_to_depot / distance_scaler  # [B, N, 1]
+            
+            # Angle is scale-invariant, so no normalization needed
             angle_to_depot = torch.atan2(
                 client_locs_centered[..., 1:], client_locs_centered[..., :1]
-            )
+            )  # [B, N, 1]
+            
             clients_feats = torch.cat(
-                [clients_feats, dist_to_depot, angle_to_depot], dim=-1
+                [clients_feats, dist_to_depot_normalized, angle_to_depot], dim=-1
             )
 
         clients_embedding = self.init_embed_clients(clients_feats)
@@ -166,10 +191,10 @@ class PVRPWDPContextEmbedding(BaseMultiAgentContextEmbedding):
     def _agent_state_embedding(self, embeddings, td, num_agents, num_cities):
         # Compute dynamic scalers from data (same as in PVRPWDPInitEmbedding)
         demands = td["demand"][..., 0, num_agents:]  # [B, N]
-        capacities = td["capacity"]  # [B, m]
-        speeds = td["speed"]  # [B, m]
-        endurances = td["endurance"]  # [B, m]
-        time_windows = td["time_window"][..., :, :]  # [B, N, 2]
+        capacities = td["agents_capacity"]  # [B, m]
+        speeds = td["agents_speed"]  # [B, m]
+        endurances = td["agents_endurance"]  # [B, m]
+        time_windows = td["time_window"][..., num_agents:, :]  # [B, N, 2] - customers only, exclude depot!
         
         # demand_scaler = max(all demands, all capacities)
         demand_scaler = torch.maximum(
@@ -203,15 +228,32 @@ class PVRPWDPContextEmbedding(BaseMultiAgentContextEmbedding):
             dim=-1,
         )
         if self.use_time_to_depot:
+            # NOTE: We should use actual (unnormalized) coordinates for distance calculation
+            # because agents_speed is in actual units (m/s), not normalized units
+            # The time computation needs to match the env's physics
             depot = td["locs"][..., 0:1, :]
             cur_loc = gather_by_index(td["locs"], td["current_node"])
             dist_to_depot = torch.norm(cur_loc - depot, p=2, dim=-1, keepdim=True)
-            time_to_depot = dist_to_depot / td["agents_speed"][..., None]
-            time_to_depot_normalized = time_to_depot / time_scaler
+            
+            # Avoid division by zero for speed (add small epsilon)
+            agent_speed_safe = torch.where(
+                td["agents_speed"][..., None] > 1e-6,
+                td["agents_speed"][..., None],
+                torch.ones_like(td["agents_speed"][..., None]) * 1e-6
+            )
+            time_to_depot = dist_to_depot / agent_speed_safe
+            
+            # Avoid division by zero for time_scaler (should not happen but be safe)
+            time_scaler_safe = torch.where(
+                time_scaler > 1e-6,
+                time_scaler,
+                torch.ones_like(time_scaler)
+            )
+            time_to_depot_normalized = time_to_depot / time_scaler_safe
             
             # Time to deadline = deadline - current_time (already in actual time units)
             time_to_deadline = (td["trip_deadline"] - td["current_time"])[..., None]
-            time_to_deadline_normalized = time_to_deadline / time_scaler
+            time_to_deadline_normalized = time_to_deadline / time_scaler_safe
             
             context_feats = torch.cat([context_feats, time_to_depot_normalized, time_to_deadline_normalized], dim=-1)
         return self.proj_agent_feats(context_feats)
