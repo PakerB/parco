@@ -174,14 +174,14 @@ class PVRPWDPContextEmbedding(BaseMultiAgentContextEmbedding):
     def __init__(
         self,
         embed_dim,
-        agent_feat_dim=3,  # Changed from 2 to 3: current_time, remaining_capacity, remaining_endurance
+        agent_feat_dim=3,  # current_time, remaining_capacity, remaining_endurance
         global_feat_dim=1,
         normalize_endurance_by_max=False,
         use_time_to_depot=True,
         **kwargs,
     ):
         if use_time_to_depot:
-            agent_feat_dim += 2  # time_to_depot + time_to_deadline
+            agent_feat_dim += 3  # time_to_depot + time_to_deadline + effective_time_limit
         super(PVRPWDPContextEmbedding, self).__init__(
             embed_dim, agent_feat_dim, global_feat_dim, **kwargs
         )
@@ -217,13 +217,15 @@ class PVRPWDPContextEmbedding(BaseMultiAgentContextEmbedding):
         # Use current_time directly from td (already computed in env)
         current_time_normalized = td["current_time"] / time_scaler.squeeze(-1)  # [B, M]
         
+        # Compute remaining endurance normalized by time_scaler (same reference as all time features)
+        remaining_endurance_norm = (td["agents_endurance"] - td["used_endurance"]) / time_scaler.squeeze(-1)  # [B, M]
+        
         context_feats = torch.stack(
             [
-                current_time_normalized,  # current time (normalized)
+                current_time_normalized,  # current time (normalized by time_scaler)
                 (td["agents_capacity"] - td["used_capacity"])
-                / demand_scaler.squeeze(-1),  # remaining capacity
-                (td["agents_endurance"] - td["used_endurance"])
-                / endurance_scaler.squeeze(-1),  # remaining endurance (normalized by endurance_scaler)
+                / demand_scaler.squeeze(-1),  # remaining capacity (normalized by demand_scaler)
+                remaining_endurance_norm,  # remaining endurance (normalized by time_scaler - SAME as other time features)
             ],
             dim=-1,
         )
@@ -255,7 +257,26 @@ class PVRPWDPContextEmbedding(BaseMultiAgentContextEmbedding):
             time_to_deadline = (td["trip_deadline"] - td["current_time"])[..., None]
             time_to_deadline_normalized = time_to_deadline / time_scaler_safe
             
-            context_feats = torch.cat([context_feats, time_to_depot_normalized, time_to_deadline_normalized], dim=-1)
+            # Compute effective time limit = min(remaining_endurance, time_to_deadline)
+            # IMPORTANT: Compute min BEFORE normalization using actual time values (same units)
+            remaining_endurance_actual = td["agents_endurance"] - td["used_endurance"]  # [B, M] actual time
+            time_to_deadline_actual = (td["trip_deadline"] - td["current_time"])  # [B, M] actual time
+            
+            # Min of actual values (both in actual time units)
+            effective_time_limit_actual = torch.minimum(
+                remaining_endurance_actual,
+                time_to_deadline_actual
+            )  # [B, M]
+            
+            # Then normalize by time_scaler (SAME as all other time features)
+            effective_time_limit = effective_time_limit_actual / time_scaler_safe.squeeze(-1)  # [B, M] normalized by time_scaler
+            
+            context_feats = torch.cat([
+                context_feats, 
+                time_to_depot_normalized,      # Travel time normalized by time_scaler
+                time_to_deadline_normalized,   # Deadline normalized by time_scaler
+                effective_time_limit[..., None]  # Effective limit normalized by time_scaler [B, M, 1]
+            ], dim=-1)
         return self.proj_agent_feats(context_feats)
 
     def _global_state_embedding(self, embeddings, td, num_agents, num_cities):
