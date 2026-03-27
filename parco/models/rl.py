@@ -37,6 +37,7 @@ class PARCORLModule(SymNCO):
         train_max_size: int = 100,
         val_test_num_agents: int = 10,
         allow_multi_dataloaders: bool = True,
+        use_dynamic_resample: bool = False,
         **kwargs,
     ):
         # Pass no baseline to superclass since there are multiple custom baselines
@@ -65,6 +66,7 @@ class PARCORLModule(SymNCO):
         self.train_max_size = train_max_size
         self.val_test_num_agents = val_test_num_agents
         self.allow_multi_dataloaders = allow_multi_dataloaders
+        self.use_dynamic_resample = use_dynamic_resample  # ← NEW FLAG
 
         # Force env to have as num_agents and num_locs as the maximum number of agents and locations
         self.env.generator.num_loc = self.train_max_size
@@ -77,12 +79,30 @@ class PARCORLModule(SymNCO):
         num_agents = None  # done inside the sampling
         # Sample number of agents during training step
         if phase == "train":
-            # Idea: we always have batches of the same size from the dataloader.
-            # however, here we sample a subset of agents and locations from the batch.
-            # For instance: if we have always 10 depots and 100 cities, we sample a random number of depots and cities
-            # from the batch. This way, we can train on different number of agents and locations.
-            num_agents = randint(self.train_min_agents, self.train_max_agents)
-            num_locs = randint(self.train_min_size, self.train_max_size)
+            if self.use_dynamic_resample:
+                # Dynamic resample strategy: based on batch data size
+                # Get current batch size from locs
+                batch_locs_size = batch["locs"].size(-2)  # Number of customers in current batch
+                
+                # Random sample num_locs: from 20 to batch_locs_size
+                num_locs = randint(20, batch_locs_size)
+                
+                # Determine num_agents based on num_locs ranges
+                if num_locs <= 40:
+                    num_agents = randint(4, 6)       # Small problems: 4-6 agents
+                elif num_locs <= 80:
+                    num_agents = randint(6, 10)      # Medium problems: 6-10 agents
+                else:  # num_locs > 80
+                    num_agents = randint(8, 12)      # Large problems: 8-12 agents
+            else:
+                # Static resample strategy: use predefined train_min/max values
+                # Idea: we always have batches of the same size from the dataloader.
+                # however, here we sample a subset of agents and locations from the batch.
+                # For instance: if we have always 10 depots and 100 cities, we sample a random number of depots and cities
+                # from the batch. This way, we can train on different number of agents and locations.
+                num_agents = randint(self.train_min_agents, self.train_max_agents)
+                num_locs = randint(self.train_min_size, self.train_max_size)
+            
             batch = resample_batch(batch, num_agents, num_locs)
         else:
             if self.allow_multi_dataloaders:

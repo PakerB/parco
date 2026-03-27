@@ -24,23 +24,51 @@ def resample_batch(td, num_agents, num_locs):
         # also, set the "num_agents" key to the new number of agents
         td.set_("num_agents", torch.full((*td.batch_size,), num_agents, device=td.device))
 
+    # ============ LOCATION DATA (slice by num_locs) ============
     td = replace_key_td(td, "locs", td["locs"][..., :num_locs, :])
 
-    # For early time windows
+    # For early time windows (OMDCPDP)
     if "pickup_et" in td.keys():
         td = replace_key_td(td, "pickup_et", td["pickup_et"][..., : num_locs // 2])
     if "delivery_et" in td.keys():
         td = replace_key_td(td, "delivery_et", td["delivery_et"][..., : num_locs // 2])
 
-    # Capacities
+    # ============ AGENT-SPECIFIC ATTRIBUTES (slice by num_agents) ============
+    # HCVRP / OMDCPDP
     if "capacity" in td.keys():
         td = replace_key_td(td, "capacity", td["capacity"][..., :num_agents])
 
     if "speed" in td.keys():
         td = replace_key_td(td, "speed", td["speed"][..., :num_agents])
 
+    # PVRPWDP
+    if "agents_capacity" in td.keys():
+        td = replace_key_td(td, "agents_capacity", td["agents_capacity"][..., :num_agents])
+    
+    if "agents_speed" in td.keys():
+        td = replace_key_td(td, "agents_speed", td["agents_speed"][..., :num_agents])
+    
+    if "agents_endurance" in td.keys():
+        td = replace_key_td(td, "agents_endurance", td["agents_endurance"][..., :num_agents])
+
+    # ============ CUSTOMER-SPECIFIC ATTRIBUTES (slice by num_locs) ============
     if "demand" in td.keys():
         td = replace_key_td(td, "demand", td["demand"][..., :num_locs])
+
+    # Time windows
+    if "time_windows" in td.keys():
+        td = replace_key_td(td, "time_windows", td["time_windows"][..., :num_locs, :])
+
+    # Waiting time (PVRPWDP) - only customers (depots added in env._reset)
+    if "waiting_time" in td.keys():
+        td = replace_key_td(td, "waiting_time", td["waiting_time"][..., :num_locs])
+    
+    # Pickup/Delivery time windows (OMDCPDP)
+    if "pickup_et" in td.keys():
+        td = replace_key_td(td, "pickup_et", td["pickup_et"][..., :num_locs // 2])
+    
+    if "delivery_et" in td.keys():
+        td = replace_key_td(td, "delivery_et", td["delivery_et"][..., :num_locs // 2])
 
     return td
 

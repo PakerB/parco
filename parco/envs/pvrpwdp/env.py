@@ -81,6 +81,7 @@ class PVRPWDPVEnv(EpochDataEnvBase):
             speed:          [B, M]
             capacity:       [B, M]
             endurance:      [B, M]
+        'num_agents'
     
     Output Reset TensorDict Shape (after _reset):
         N: num customer
@@ -461,8 +462,8 @@ class PVRPWDPVEnv(EpochDataEnvBase):
         unvisited_ratio = unvisited_count / num_customers  # [B], trong khoảng [0, 1]
         
         # Cost = alpha * (makespan / max_time) + beta * (unvisited / total)
-        # cost = alpha * makespan_normalized + beta * unvisited_ratio
-        cost = unvisited_count
+        cost = alpha * makespan_normalized + beta * unvisited_ratio
+        # cost = unvisited_count
         
         # Reward = -cost
         return -cost
