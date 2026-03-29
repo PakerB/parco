@@ -127,6 +127,11 @@ class PVRPWDPVEnv(EpochDataEnvBase):
         target: str = "makespan",
         rent_price: float = 20.0,
         travel_price: float = 1.0,
+        # target=mincost: hệ số theo loại xe (giữ dạng travel_length * giá + xe_dùng * phí thuê)
+        rent_price_truck: float = 40.0,
+        rent_price_drone: float = 10.0,
+        travel_price_truck: float = 0.35,
+        travel_price_drone: float = 1.5,
         
         **kwargs,
     ):
@@ -146,6 +151,10 @@ class PVRPWDPVEnv(EpochDataEnvBase):
         self.target = target
         self.rent_price = rent_price
         self.travel_price = travel_price
+        self.rent_price_truck = float(rent_price_truck)
+        self.rent_price_drone = float(rent_price_drone)
+        self.travel_price_truck = float(travel_price_truck)
+        self.travel_price_drone = float(travel_price_drone)
 
     def _reset(
         self, 
@@ -434,6 +443,14 @@ class PVRPWDPVEnv(EpochDataEnvBase):
         impossible = all_at_depot & ~any_agent_can_reach & ~done
         
         return impossible
+
+    @staticmethod
+    def _truck_mask_from_capacity(agents_capacity: torch.Tensor) -> torch.Tensor:
+        """[B, M] float 1 = xe tải, 0 = drone (capacity cao hơn ngưỡng giữa min–max)."""
+        max_c = agents_capacity.max(dim=-1, keepdim=True).values
+        min_c = agents_capacity.min(dim=-1, keepdim=True).values
+        thresh = (max_c + min_c) * 0.5
+        return (agents_capacity > thresh + 1e-6).to(dtype=agents_capacity.dtype, device=agents_capacity.device)
     
     def _get_reward(self, td: TensorDict, actions: torch.Tensor) -> torch.Tensor:
         """
@@ -468,23 +485,27 @@ class PVRPWDPVEnv(EpochDataEnvBase):
         unvisited_ratio = unvisited_count / num_customers  # [B], trong khoảng [0, 1]
         
         # Cost = alpha * (makespan / max_time) + beta * (unvisited / total)
-<<<<<<< HEAD
         cost = alpha * makespan_normalized + beta * unvisited_ratio
-        # cost = unvisited_count
-=======
-        # cost = alpha * makespan_normalized + beta * unvisited_ratio
 
->>>>>>> 70013400a58d644f896a0b00abc2d569b6a2f300
-        
-        # Reward = -cost
-        travel_cost, rent_cost = 0, 0
-        for m in range(num_agents):
-            travel_cost += td["current_length"][m]
-            rent_cost += (td["current_length"][m] > 0) 
         if self.target == "makespan":
-            cost = unvisited_count 
+            cost = unvisited_count
         elif self.target == "mincost":
-            cost = alpha * (travel_cost * self.travel_price + rent_cost * self.rent_price) + beta * unvisited_count
+            # Giữ công thức: sum(travel * travel_price + rent * rent_price) + beta * unvisited;
+            # rent = 1 nếu xe có quãng đường > 0. Thông số tách theo tải / drone.
+            is_truck = self._truck_mask_from_capacity(td["agents_capacity"])
+            travel_vec = (
+                is_truck * self.travel_price_truck
+                + (1.0 - is_truck) * self.travel_price_drone
+            )
+            rent_vec = (
+                is_truck * self.rent_price_truck
+                + (1.0 - is_truck) * self.rent_price_drone
+            )
+            travel_part = (td["current_length"] * travel_vec).sum(dim=-1)
+            used = (td["current_length"] > 1e-8).to(dtype=travel_vec.dtype, device=travel_vec.device)
+            rent_part = (used * rent_vec).sum(dim=-1)
+            # alpha=0 làm mất hạng mục chi phí; với mincost chỉ tối ưu (travel+rent) + phạt khách
+            cost = travel_part + rent_part + beta * unvisited_count
         else:
             raise NotImplementedError(f"Invalid target: {self.target}")
         return -cost
