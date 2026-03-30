@@ -125,8 +125,8 @@ class PVRPWDPVEnv(EpochDataEnvBase):
         use_epoch_data: bool = True,
         fallback_to_generator: bool = True,
         target: str = "makespan",
-        rent_price: float = 20.0,
-        travel_price: float = 1.0,
+        # rent_price: float = 20.0,
+        # travel_price: float = 1.0,
         # target=mincost: hệ số theo loại xe (giữ dạng travel_length * giá + xe_dùng * phí thuê)
         rent_price_truck: float = 40.0,
         rent_price_drone: float = 10.0,
@@ -149,12 +149,12 @@ class PVRPWDPVEnv(EpochDataEnvBase):
 
         self._make_spec(self.generator)
         self.target = target
-        self.rent_price = rent_price
-        self.travel_price = travel_price
+        # self.rent_price = rent_price
+        # self.travel_price = travel_price
         self.rent_price_truck = float(rent_price_truck)
         self.rent_price_drone = float(rent_price_drone)
-        self.travel_price_truck = float(travel_price_truck)
-        self.travel_price_drone = float(travel_price_drone)
+        self.travel_price_truck = float(travel_price_truck/1000)
+        self.travel_price_drone = float(travel_price_drone/3600)
 
     def _reset(
         self, 
@@ -490,7 +490,6 @@ class PVRPWDPVEnv(EpochDataEnvBase):
         if self.target == "makespan":
             cost = unvisited_count
         elif self.target == "mincost":
-            # Giữ công thức: sum(travel * travel_price + rent * rent_price) + beta * unvisited;
             # rent = 1 nếu xe có quãng đường > 0. Thông số tách theo tải / drone.
             is_truck = self._truck_mask_from_capacity(td["agents_capacity"])
             travel_vec = (
