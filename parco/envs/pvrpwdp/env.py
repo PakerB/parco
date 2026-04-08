@@ -490,7 +490,6 @@ class PVRPWDPVEnv(EpochDataEnvBase):
         if self.target == "makespan":
             cost = unvisited_count
         elif self.target == "mincost":
-            # rent = 1 nếu xe có quãng đường > 0. Thông số tách theo tải / drone.
             is_truck = self._truck_mask_from_capacity(td["agents_capacity"])
             travel_vec = (
                 is_truck * self.travel_price_truck
@@ -503,8 +502,21 @@ class PVRPWDPVEnv(EpochDataEnvBase):
             travel_part = (td["current_length"] * travel_vec).sum(dim=-1)
             used = (td["current_length"] > 1e-8).to(dtype=travel_vec.dtype, device=travel_vec.device)
             rent_part = (used * rent_vec).sum(dim=-1)
-            # alpha=0 làm mất hạng mục chi phí; với mincost chỉ tối ưu (travel+rent) + phạt khách
-            cost = travel_part + rent_part + beta * unvisited_count
+
+            # --- Adaptive big-M: lambda_u > max possible (travel + rent) per instance ---
+            # Ensures visiting all customers is always strictly better than any feasible cost.
+            # Works for any N customers or map size without manual tuning.
+            rent_max = rent_vec.sum(dim=-1)                                    # [B] all vehicles used
+            all_locs = td["locs"]                                              # [B, M+N, 2]
+            bbox_diag = all_locs.max(dim=-2).values - all_locs.min(dim=-2).values  # [B, 2]
+            diameter_ub = bbox_diag.norm(dim=-1)                               # [B]
+            max_travel_price = travel_vec.max(dim=-1).values                   # [B]
+            travel_max = 2.0 * diameter_ub * num_customers * max_travel_price  # [B]
+            lambda_u = travel_max + rent_max + 1.0                             # [B]
+
+            # Priority 1 (hard): visit all customers
+            # Priority 2       : minimize money cost (travel + rent)
+            cost = lambda_u * unvisited_count + travel_part + rent_part
         else:
             raise NotImplementedError(f"Invalid target: {self.target}")
         return -cost
@@ -665,9 +677,10 @@ class PVRPWDPVEnv(EpochDataEnvBase):
         # === Original depot isolation logic ===
         # The depot is not available if **all** the agents are at the depot and the task is not finished
         all_back_flag = torch.sum(td["current_node"] >= num_agents, dim=-1) == 0
-        has_finished_early = all_back_flag & ~td["done"]
+        done_flat = td["done"].squeeze(-1) if td["done"].dim() > 1 else td["done"]
+        has_finished_early = all_back_flag & ~done_flat
 
-        depot_mask = ~has_finished_early[..., None]  # 1 means we can visit
+        depot_mask = ~has_finished_early[..., None]  # [B, 1]; 1 means we can visit
 
         # If no available nodes outside (all visited), make the depot always available
         all_visited_flag = (
