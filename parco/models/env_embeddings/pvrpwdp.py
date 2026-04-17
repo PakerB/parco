@@ -85,6 +85,12 @@ class PVRPWDPInitEmbedding(nn.Module):
         else:
             endurance_scaler = time_scaler  # Use time_scaler for endurance normalization
         
+        # Clamp scalers to avoid division by zero or extreme values
+        demand_scaler = torch.clamp(demand_scaler, min=1e-6)
+        speed_scaler = torch.clamp(speed_scaler, min=1e-6)
+        time_scaler = torch.clamp(time_scaler, min=1e-6)
+        endurance_scaler = torch.clamp(endurance_scaler, min=1e-6)
+        
         # Compute distance scaler from actual coordinates (for normalizing spatial features)
         # Use max distance from depot to any location
         all_locs = td["locs"]  # [B, M+N, 2]

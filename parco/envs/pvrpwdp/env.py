@@ -124,6 +124,10 @@ class PVRPWDPVEnv(EpochDataEnvBase):
         epoch_file_pattern: str = "epoch_{epoch}.npz",
         use_epoch_data: bool = True,
         fallback_to_generator: bool = True,
+        target: str = "makespan",
+        rent_price: float = 20.0,
+        travel_price: float = 1.0,
+        
         **kwargs,
     ):
         if generator is None:
@@ -139,6 +143,9 @@ class PVRPWDPVEnv(EpochDataEnvBase):
         )
 
         self._make_spec(self.generator)
+        self.target = target
+        self.rent_price = rent_price
+        self.travel_price = travel_price
 
     def _reset(
         self, 
@@ -462,10 +469,21 @@ class PVRPWDPVEnv(EpochDataEnvBase):
         unvisited_ratio = unvisited_count / num_customers  # [B], trong khoảng [0, 1]
         
         # Cost = alpha * (makespan / max_time) + beta * (unvisited / total)
-        cost = alpha * makespan_normalized + beta * unvisited_ratio
+        # cost = alpha * makespan_normalized + beta * unvisited_ratio
         # cost = unvisited_count
         
         # Reward = -cost
+        
+        if self.target == "makespan":
+            cost = unvisited_ratio
+        elif self.target == "mincost":
+            travel_cost, rent_cost = 0, 0
+            for m in range(num_agents):
+                travel_cost += td["current_length"][m]
+                rent_cost += (td["current_length"][m] > 0)
+            cost = alpha * (travel_cost * self.travel_price + rent_cost * self.rent_price) + beta * unvisited_count
+        else:
+            raise NotImplementedError(f"Invalid target: {self.target}")
         return -cost
 
     @staticmethod

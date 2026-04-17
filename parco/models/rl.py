@@ -12,7 +12,7 @@ from rl4co.utils.ops import unbatchify
 from rl4co.utils.pylogger import get_pylogger
 from torchrl.modules.models import MLP
 
-from .utils import resample_batch
+from .utils import resample_batch, resample_batch_padding
 
 log = get_pylogger(__name__)
 
@@ -37,7 +37,7 @@ class PARCORLModule(SymNCO):
         train_max_size: int = 100,
         val_test_num_agents: int = 10,
         allow_multi_dataloaders: bool = True,
-        use_dynamic_resample: bool = False,
+        use_padding_mode: bool = False,  # ✅ NEW: Enable padding mode with metadata
         **kwargs,
     ):
         # Pass no baseline to superclass since there are multiple custom baselines
@@ -66,60 +66,63 @@ class PARCORLModule(SymNCO):
         self.train_max_size = train_max_size
         self.val_test_num_agents = val_test_num_agents
         self.allow_multi_dataloaders = allow_multi_dataloaders
-        self.use_dynamic_resample = use_dynamic_resample  # ← NEW FLAG
-
-        # Force env to have as num_agents and num_locs as the maximum number of agents and locations
-        self.env.generator.num_loc = self.train_max_size
-        self.env.generator.num_agents = self.train_max_agents
+        self.use_padding_mode = use_padding_mode  # ✅ NEW: Enable padding mode with metadata
 
     def shared_step(
         self, batch: Any, batch_idx: int, phase: str, dataloader_idx: int = None
     ):
         # NOTE: deprecated
         num_agents = None  # done inside the sampling
-        # Sample number of agents during training step
-        if phase == "train":
-            if self.use_dynamic_resample:
-                # Dynamic resample strategy: based on batch data size
-                # Get current batch size from locs
-                batch_locs_size = batch["locs"].size(-2)  # Number of customers in current batch
-                
-                # Random sample num_locs: from 20 to batch_locs_size
-                num_locs = randint(20, batch_locs_size)
-                
-                # Determine num_agents based on num_locs ranges
-                if num_locs <= 40:
-                    num_agents = randint(4, 6)       # Small problems: 4-6 agents
-                elif num_locs <= 80:
-                    num_agents = randint(6, 10)      # Medium problems: 6-10 agents
-                else:  # num_locs > 80
-                    num_agents = randint(8, 12)      # Large problems: 8-12 agents
+        
+        # ✅ STRATEGY SELECTION: Choose between padding mode or random resample
+        if self.use_padding_mode:
+            # ═══════════════════════════════════════════════════════════
+            # PADDING MODE: Remove virtual nodes/agents, use batch diversity
+            # ═══════════════════════════════════════════════════════════
+            if phase == "train":
+                # STEP 1: Remove virtual padding based on metadata
+                batch = resample_batch_padding(batch)
+                # Use batch as-is after padding removal (batch diversity from data)
+            
+            # For validation/test phases
             else:
-                # Static resample strategy: use predefined train_min/max values
-                # Idea: we always have batches of the same size from the dataloader.
-                # however, here we sample a subset of agents and locations from the batch.
-                # For instance: if we have always 10 depots and 100 cities, we sample a random number of depots and cities
-                # from the batch. This way, we can train on different number of agents and locations.
+                # STEP 1: Remove virtual padding based on metadata
+                batch = resample_batch_padding(batch)
+                
+                # STEP 2: Set num_agents for multi-dataloader case
+                if self.allow_multi_dataloaders:
+                    if dataloader_idx is not None and self.dataloader_names is not None:
+                        num_agents = int(
+                            self.dataloader_names[dataloader_idx].split("_")[-1][1:]
+                        )
+                    else:
+                        num_agents = self.val_test_num_agents
+                    batch["num_agents"] = torch.full(
+                        (batch.shape[0],), num_agents, device=batch.device
+                    )
+        
+        else:
+            # ═══════════════════════════════════════════════════════════
+            # RANDOM RESAMPLE MODE (OLD): Use random subsampling
+            # ═══════════════════════════════════════════════════════════
+            if phase == "train":
+                # Static resample: predefined ranges
                 num_agents = randint(self.train_min_agents, self.train_max_agents)
                 num_locs = randint(self.train_min_size, self.train_max_size)
-            
-            batch = resample_batch(batch, num_agents, num_locs)
-        else:
-            if self.allow_multi_dataloaders:
-                # Get number of agents to test on based on dataloader name
-                if dataloader_idx is not None and self.dataloader_names is not None:
-                    # e.g. n50_m7 take only number after "m" until _
-                    num_agents = int(
-                        self.dataloader_names[dataloader_idx].split("_")[-1][1:]
+                
+                # Apply random resample
+                batch = resample_batch(batch, num_agents, num_locs)
+            else:
+                if self.allow_multi_dataloaders:
+                    if dataloader_idx is not None and self.dataloader_names is not None:
+                        num_agents = int(
+                            self.dataloader_names[dataloader_idx].split("_")[-1][1:]
+                        )
+                    else:
+                        num_agents = self.val_test_num_agents
+                    batch["num_agents"] = torch.full(
+                        (batch.shape[0],), num_agents, device=batch.device
                     )
-                else:
-                    num_agents = self.val_test_num_agents
-
-                # NOTE: trick: we subsample number of agents by setting num_agents
-                # in such case, use the same number of agents for all batches
-                batch["num_agents"] = torch.full(
-                    (batch.shape[0],), num_agents, device=batch.device
-                )
 
         # Reset env based on the number of agents
         td = self.env.reset(batch)
