@@ -8,39 +8,49 @@ from lightning.pytorch.loggers import CSVLogger
 
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
+import torch.distributed as dist
+
+
+def _make_sampler(dataset, shuffle=False):
+    """Chỉ dùng DistributedSampler khi thực sự chạy DDP, tránh lỗi trên Windows/1 GPU."""
+    if dist.is_available() and dist.is_initialized():
+        return DistributedSampler(dataset, shuffle=shuffle)
+    return None
+
 
 class CustomPARCORLModule(PARCORLModule):
     def train_dataloader(self):
         dl_old = super().train_dataloader()
-        custom_sampler = DistributedSampler(dl_old.dataset, shuffle=False)
+        sampler = _make_sampler(dl_old.dataset, shuffle=False)
         return DataLoader(
             dl_old.dataset,
-            batch_size=self.train_batch_size, # Sử dụng thuộc tính đã được thiết lập trong setup()
-            sampler=custom_sampler, 
+            batch_size=self.train_batch_size,
+            sampler=sampler,
+            shuffle=False if sampler is not None else False,
             num_workers=4,
-            collate_fn=dl_old.collate_fn
+            collate_fn=dl_old.collate_fn,
         )
 
     def val_dataloader(self):
         dl_old = super().val_dataloader()
-        custom_sampler = DistributedSampler(dl_old.dataset, shuffle=False)
+        sampler = _make_sampler(dl_old.dataset, shuffle=False)
         return DataLoader(
             dl_old.dataset,
-            batch_size=self.val_batch_size, # Sử dụng thuộc tính đã được thiết lập trong setup()
-            sampler=custom_sampler,
+            batch_size=self.val_batch_size,
+            sampler=sampler,
             num_workers=4,
-            collate_fn=dl_old.collate_fn
+            collate_fn=dl_old.collate_fn,
         )
 
     def test_dataloader(self):
         dl_old = super().test_dataloader()
-        custom_sampler = DistributedSampler(dl_old.dataset, shuffle=False)
+        sampler = _make_sampler(dl_old.dataset, shuffle=False)
         return DataLoader(
             dl_old.dataset,
-            batch_size=self.test_batch_size, # Sử dụng thuộc tính đã được thiết lập trong setup()
-            sampler=custom_sampler,
+            batch_size=self.test_batch_size,
+            sampler=sampler,
             num_workers=4,
-            collate_fn=dl_old.collate_fn
+            collate_fn=dl_old.collate_fn,
         )
 
 
@@ -54,7 +64,7 @@ class EpochDataCallback(Callback):
         """Gọi tại đầu mỗi epoch để update env.current_epoch"""
         # trainer.current_epoch bắt đầu từ 0
         self.env.current_epoch = trainer.current_epoch
-        print(f"📊 Epoch {trainer.current_epoch}: Loading pvrpwdp_epoch_{trainer.current_epoch:02d}.npz")
+        print(f"📊 Epoch {trainer.current_epoch}: Loading epoch_{trainer.current_epoch:02d}_*.npz (multi-part)")
 
 if __name__ == '__main__':
     print("🚀 Khởi động quá trình huấn luyện bằng Python Script...")
@@ -85,7 +95,7 @@ if __name__ == '__main__':
     # 2. Khởi tạo Environment
     env = PVRPWDPVEnv(
         epoch_data_dir=epoch_data_dir,
-        epoch_file_pattern="epoch_{epoch:02d}.npz",
+        epoch_file_pattern="epoch_{epoch:02d}_{part:02d}.npz",
         use_epoch_data=True,
         fallback_to_generator=False,  
         val_file=val_file,
@@ -118,15 +128,15 @@ if __name__ == '__main__':
     model = CustomPARCORLModule(
         env, 
         policy=policy,
-        train_data_size=400384,     
-        val_data_size=20736,      
+        train_data_size=1000,     
+        val_data_size=100,      
         
         # Thiết lập kích thước batch riêng biệt
         batch_size=256,            # Sẽ được dùng làm train_batch_size
         val_batch_size=256,        # Kích thước batch cho validation
         test_batch_size=256,       # Kích thước batch cho test
         
-        num_augment=16,            
+        num_augment=4,            
         use_padding_mode=True,  
         optimizer_kwargs={'lr': 1e-4, 'weight_decay': 0},
     )
@@ -147,17 +157,16 @@ if __name__ == '__main__':
     epoch_data_callback = EpochDataCallback(env)
 
     trainer = RL4COTrainer(
-        max_epochs=5,          # 
-        accelerator="gpu",
-        devices=2,              #  Dùng cả 2 card T4
-        strategy="ddp_find_unused_parameters_true",
-        reload_dataloaders_every_n_epochs=1,
-        use_distributed_sampler=False,     
-        accumulate_grad_batches=2,       
-        logger=csv_logger,               
-        callbacks=[checkpoint_callback, epoch_data_callback],  # Thêm callback
-        gradient_clip_val=1.0,
-        # Không truyền tham số accumulate_grad_batches vào đây nữa
+        max_epochs=1,
+        accelerator="cpu",
+        devices=1,
+        # strategy="auto",  # Windows + 1 GPU: không dùng DDP (NCCL không hỗ trợ Windows)
+        # reload_dataloaders_every_n_epochs=1,
+        # use_distributed_sampler=False,
+        # accumulate_grad_batches=2,
+        logger=csv_logger,
+        # callbacks=[checkpoint_callback, epoch_data_callback],
+        # gradient_clip_val=1.0,
     )
 
     # 6. Chạy Train

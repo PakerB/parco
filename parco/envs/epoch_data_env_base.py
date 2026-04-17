@@ -42,26 +42,55 @@ class MultiPartLazyDataset(torch.utils.data.Dataset):
         self.part_files = sorted(part_files)
         self.samples_per_file = samples_per_file
         self.total_samples = len(self.part_files) * samples_per_file
-        
+
         self.current_part_idx = -1
         self.current_td = None
+        # Cache các item đã "tháo" thành dict cho part đang nạp để
+        # tương thích định dạng với rl4co.data.dataset.TensorDictDataset
+        self._current_items = None
 
     def __len__(self):
         return self.total_samples
 
+    def _ensure_part_loaded(self, part_idx: int):
+        if self.current_part_idx == part_idx:
+            return
+        file_path = self.part_files[part_idx]
+        file_name = os.path.basename(file_path)
+        log.info(
+            f"🔄 [Epoch {self.epoch:02d}] - Giải phóng RAM & Nạp Part {part_idx:02d}: {file_name}"
+        )
+        td = load_npz_to_tensordict(file_path)
+        self.current_td = td
+        # Disassemble TensorDict -> list[dict[str, Tensor]] giống TensorDictDataset
+        # để collate_fn hoạt động đúng với rl4co._dataloader_single.
+        n = td.batch_size[0]
+        self._current_items = [
+            {key: value[i] for key, value in td.items()} for i in range(n)
+        ]
+        self.current_part_idx = part_idx
+
     def __getitem__(self, idx):
         part_idx = idx // self.samples_per_file
         item_idx = idx % self.samples_per_file
+        self._ensure_part_loaded(part_idx)
+        return self._current_items[item_idx]
 
-        if self.current_part_idx != part_idx:
-            file_path = self.part_files[part_idx]
-            file_name = os.path.basename(file_path)
-            log.info(f"🔄 [Epoch {self.epoch:02d}] - Giải phóng RAM & Nạp Part {part_idx:02d}: {file_name}")
-            
-            self.current_td = load_npz_to_tensordict(file_path)
-            self.current_part_idx = part_idx
+    @staticmethod
+    def collate_fn(batch):
+        """Collate list of dicts thành một TensorDict batched.
 
-        return self.current_td[item_idx]
+        Sao chép hành vi của `rl4co.data.dataset.TensorDictDataset.collate_fn`
+        để tương thích với `rl4co.models.rl.common.base._dataloader_single`.
+        """
+        # Trường hợp hiếm: nếu item là TensorDict (khi __getitem__ bị override),
+        # dùng torch.stack trực tiếp.
+        if isinstance(batch[0], TensorDict):
+            return torch.stack(batch, dim=0)
+        return TensorDict(
+            {key: torch.stack([b[key] for b in batch]) for key in batch[0].keys()},
+            batch_size=torch.Size([len(batch)]),
+        )
 
 
 class EpochDataEnvBase(RL4COEnvBase):

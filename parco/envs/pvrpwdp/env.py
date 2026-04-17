@@ -125,8 +125,10 @@ class PVRPWDPVEnv(EpochDataEnvBase):
         use_epoch_data: bool = True,
         fallback_to_generator: bool = True,
         target: str = "makespan",
-        rent_price: float = 20.0,
-        travel_price: float = 1.0,
+        rent_price_truck: float = 40.0,
+        rent_price_drone: float = 10.0,
+        travel_price_truck: float = 0.35,
+        travel_price_drone: float = 1.5,
         
         **kwargs,
     ):
@@ -144,8 +146,10 @@ class PVRPWDPVEnv(EpochDataEnvBase):
 
         self._make_spec(self.generator)
         self.target = target
-        self.rent_price = rent_price
-        self.travel_price = travel_price
+        self.rent_price_truck = float(rent_price_truck)
+        self.rent_price_drone = float(rent_price_drone)
+        self.travel_price_truck = float(travel_price_truck/1000)
+        self.travel_price_drone = float(travel_price_drone/3600)
 
     def _reset(
         self, 
@@ -170,12 +174,14 @@ class PVRPWDPVEnv(EpochDataEnvBase):
         demand_depot = torch.zeros(
             (*batch_size, num_agents), dtype=torch.float32, device=device
         )
+        # demand = torch.cat((demand_depot, td["demand"]), -1)
+
+        # # Repeat the demand for each agent, for convinent action mask calculation
+        # # Note that this will take more memory
+        # demand = demand.unsqueeze(-2).repeat(1, num_agents, 1)
+        demand_depot = torch.zeros((*batch_size, num_agents), dtype=torch.float32, device=device)
         demand = torch.cat((demand_depot, td["demand"]), -1)
-
-        # Repeat the demand for each agent, for convinent action mask calculation
-        # Note that this will take more memory
-        demand = demand.unsqueeze(-2).repeat(1, num_agents, 1)
-
+        
         speeds = td["agents_speed"]
         speed_min = speeds.min(dim=-1, keepdim=True)[0]  # [B, 1]
         
@@ -410,6 +416,72 @@ class PVRPWDPVEnv(EpochDataEnvBase):
         if no_progress_possible.any():
             td["done"] = td["done"] | no_progress_possible.unsqueeze(-1)
         return td
+
+    @staticmethod
+    def _compute_operating_time(td: TensorDict, actions: torch.Tensor) -> torch.Tensor:
+        """Replay action sequence to compute total operating time per agent.
+
+        Operating time = travel_time + mid-trip waiting_time (NOT counting
+        waiting before departing from a depot), accumulated across the whole
+        mission. This mirrors the endurance-consumption logic in `_step`
+        (waiting time only counts when the agent is already mid-trip), but we
+        do not reset at depot visits since we want the full operating time
+        for cost computation.
+
+        Args:
+            td:      final TensorDict (uses `locs`, `time_window`, `agents_speed`).
+            actions: [B, M, L] action tensor from PARCO decoder
+                     (agents dim before steps dim).
+
+        Returns:
+            op_time: [B, M] total operating time per agent.
+        """
+        B, M, L = actions.shape
+        device = actions.device
+        dtype = td["agents_speed"].dtype
+
+        # Initial state at reset: each agent i sits at depot slot i (node index i)
+        prev_node = (
+            torch.arange(M, device=device).unsqueeze(0).expand(B, M).clone()
+        )  # [B, M]
+        current_time = torch.zeros(B, M, device=device, dtype=dtype)
+        op_time = torch.zeros(B, M, device=device, dtype=dtype)
+
+        locs = td["locs"]                         # [B, M+N, 2]
+        earliest_all = td["time_window"][..., 0]  # [B, M+N]
+        speed = td["agents_speed"]                # [B, M]
+
+        for t in range(L):
+            action = actions[..., t]  # [B, M]
+
+            prev_loc = gather_by_index(locs, prev_node)   # [B, M, 2]
+            curr_loc = gather_by_index(locs, action)      # [B, M, 2]
+            stay_flag = action == prev_node
+
+            step_dist = get_distance(prev_loc, curr_loc)              # [B, M]
+            travel_time = (step_dist / speed) * (~stay_flag).to(dtype)
+
+            arrival_time = current_time + travel_time
+            selected_earliest = gather_by_index(earliest_all, action)  # [B, M]
+            new_current_time = torch.maximum(arrival_time, selected_earliest)
+
+            # Waiting only counts if NOT departing from a depot (mirrors _step)
+            is_departing_from_depot = prev_node < M
+            waiting_at_node = torch.clamp(
+                selected_earliest - arrival_time, min=0.0
+            ) * (~stay_flag).to(dtype)
+
+            step_op = torch.where(
+                is_departing_from_depot,
+                travel_time,
+                travel_time + waiting_at_node,
+            )
+
+            op_time = op_time + step_op
+            current_time = new_current_time
+            prev_node = action
+
+        return op_time
     
     def _check_impossibility(self, td: TensorDict, num_agents: int) -> torch.Tensor:
         """
@@ -477,11 +549,46 @@ class PVRPWDPVEnv(EpochDataEnvBase):
         if self.target == "makespan":
             cost = unvisited_ratio
         elif self.target == "mincost":
-            travel_cost, rent_cost = 0, 0
-            for m in range(num_agents):
-                travel_cost += td["current_length"][m]
-                rent_cost += (td["current_length"][m] > 0)
-            cost = alpha * (travel_cost * self.travel_price + rent_cost * self.rent_price) + beta * unvisited_count
+            is_truck = self._truck_mask_from_capacity(td["agents_capacity"])
+            travel_vec = (
+                is_truck * self.travel_price_truck
+                + (1.0 - is_truck) * self.travel_price_drone
+            )
+            rent_vec = (
+                is_truck * self.rent_price_truck
+                + (1.0 - is_truck) * self.rent_price_drone
+            )
+
+            # --- Replay actions to compute drone operating time ---
+            # Drone cost is time-based (travel + mid-trip waiting), matching
+            # the `used_endurance` accumulation logic in `_step` (but NOT reset
+            # at depot, since we want total operating time across the mission).
+            # Truck cost remains distance-based (uses `current_length`).
+            op_time = self._compute_operating_time(td, actions)  # [B, M]
+            length = td["current_length"]                         # [B, M]
+
+            travel_part = (
+                is_truck * length * self.travel_price_truck
+                + (1.0 - is_truck) * op_time * self.travel_price_drone
+            ).sum(dim=-1)
+
+            used = (length > 1e-8).to(dtype=travel_vec.dtype, device=travel_vec.device)
+            rent_part = (used * rent_vec).sum(dim=-1)
+
+            # --- Adaptive big-M: lambda_u > max possible (travel + rent) per instance ---
+            # Ensures visiting all customers is always strictly better than any feasible cost.
+            # Works for any N customers or map size without manual tuning.
+            rent_max = rent_vec.sum(dim=-1)                                    # [B] all vehicles used
+            all_locs = td["locs"]                                              # [B, M+N, 2]
+            bbox_diag = all_locs.max(dim=-2).values - all_locs.min(dim=-2).values  # [B, 2]
+            diameter_ub = bbox_diag.norm(dim=-1)                               # [B]
+            max_travel_price = travel_vec.max(dim=-1).values                   # [B]
+            travel_max = 2.0 * diameter_ub * num_customers * max_travel_price  # [B]
+            lambda_u = travel_max + rent_max + 1.0                             # [B]
+
+            # Priority 1 (hard): visit all customers
+            # Priority 2       : minimize money cost (travel + rent)
+            cost = lambda_u * unvisited_count + travel_part + rent_part
         else:
             raise NotImplementedError(f"Invalid target: {self.target}")
         return -cost
@@ -497,8 +604,12 @@ class PVRPWDPVEnv(EpochDataEnvBase):
         )
 
         # Can not visit the node if the demand is more than the remaining capacity
+        # remain_capacity = td["agents_capacity"] - td["used_capacity"]
+        # within_capacity_flag = td["demand"] <= remain_capacity[..., None]  # TODO: check
         remain_capacity = td["agents_capacity"] - td["used_capacity"]
-        within_capacity_flag = td["demand"] <= remain_capacity[..., None]  # TODO: check
+        
+        # Thêm unsqueeze(-2) cho demand và unsqueeze(-1) cho remain_capacity
+        within_capacity_flag = td["demand"].unsqueeze(-2) <= remain_capacity.unsqueeze(-1)
         action_mask &= within_capacity_flag
 
         # === PVRPWDP-specific constraints: Time window and deadline ===
@@ -627,16 +738,17 @@ class PVRPWDPVEnv(EpochDataEnvBase):
                 if should_block_current.any():
                     # Vectorized: Create mask to block current_node
                     # For affected agents, set their current_node action to False
-                    block_mask = torch.zeros_like(action_mask, dtype=torch.bool)  # [B, m, m+N]
+                    # ĐOẠN CODE MỚI: Vector hóa 100%
+                    block_mask = torch.zeros_like(action_mask, dtype=torch.bool)
                     
-                    # Scatter ones at positions where should block current_node
-                    for b in range(batch_size[0]):
-                        for m_idx in range(num_agents):
-                            if should_block_current[b, m_idx]:
-                                current_idx = td["current_node"][b, m_idx].item()
-                                block_mask[b, m_idx, current_idx] = True
+                    # Chuẩn bị index và value cho scatter
+                    indices = td["current_node"].unsqueeze(-1) # Shape: [B, m, 1]
+                    src = should_block_current.unsqueeze(-1)   # Shape: [B, m, 1]
                     
-                    # Apply block: set these positions to False
+                    # Bắn giá trị (src) vào block_mask tại các tọa độ (indices) dọc theo chiều cuối cùng (dim=-1)
+                    block_mask.scatter_(dim=-1, index=indices, src=src)
+                    
+                    # Áp dụng mask
                     action_mask = action_mask & ~block_mask
         
         # === Original depot isolation logic ===
