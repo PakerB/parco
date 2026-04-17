@@ -125,13 +125,8 @@ class PVRPWDPVEnv(EpochDataEnvBase):
         use_epoch_data: bool = True,
         fallback_to_generator: bool = True,
         target: str = "makespan",
-        # rent_price: float = 20.0,
-        # travel_price: float = 1.0,
-        # target=mincost: hệ số theo loại xe (giữ dạng travel_length * giá + xe_dùng * phí thuê)
-        rent_price_truck: float = 40.0,
-        rent_price_drone: float = 10.0,
-        travel_price_truck: float = 0.35,
-        travel_price_drone: float = 1.5,
+        rent_price: float = 20.0,
+        travel_price: float = 1.0,
         
         **kwargs,
     ):
@@ -149,12 +144,8 @@ class PVRPWDPVEnv(EpochDataEnvBase):
 
         self._make_spec(self.generator)
         self.target = target
-        # self.rent_price = rent_price
-        # self.travel_price = travel_price
-        self.rent_price_truck = float(rent_price_truck)
-        self.rent_price_drone = float(rent_price_drone)
-        self.travel_price_truck = float(travel_price_truck/1000)
-        self.travel_price_drone = float(travel_price_drone/3600)
+        self.rent_price = rent_price
+        self.travel_price = travel_price
 
     def _reset(
         self, 
@@ -443,14 +434,6 @@ class PVRPWDPVEnv(EpochDataEnvBase):
         impossible = all_at_depot & ~any_agent_can_reach & ~done
         
         return impossible
-
-    @staticmethod
-    def _truck_mask_from_capacity(agents_capacity: torch.Tensor) -> torch.Tensor:
-        """[B, M] float 1 = xe tải, 0 = drone (capacity cao hơn ngưỡng giữa min–max)."""
-        max_c = agents_capacity.max(dim=-1, keepdim=True).values
-        min_c = agents_capacity.min(dim=-1, keepdim=True).values
-        thresh = (max_c + min_c) * 0.5
-        return (agents_capacity > thresh + 1e-6).to(dtype=agents_capacity.dtype, device=agents_capacity.device)
     
     def _get_reward(self, td: TensorDict, actions: torch.Tensor) -> torch.Tensor:
         """
@@ -470,6 +453,7 @@ class PVRPWDPVEnv(EpochDataEnvBase):
         """
         alpha = 0.0
         beta = 20.0
+        
         num_agents = td["current_node"].size(-1)
         num_customers = td["visited"].shape[-1] - num_agents  # total locations - depot slots
         
@@ -485,38 +469,19 @@ class PVRPWDPVEnv(EpochDataEnvBase):
         unvisited_ratio = unvisited_count / num_customers  # [B], trong khoảng [0, 1]
         
         # Cost = alpha * (makespan / max_time) + beta * (unvisited / total)
-        cost = alpha * makespan_normalized + beta * unvisited_ratio
-
+        # cost = alpha * makespan_normalized + beta * unvisited_ratio
+        # cost = unvisited_count
+        
+        # Reward = -cost
+        
         if self.target == "makespan":
-            cost = unvisited_count
+            cost = unvisited_ratio
         elif self.target == "mincost":
-            is_truck = self._truck_mask_from_capacity(td["agents_capacity"])
-            travel_vec = (
-                is_truck * self.travel_price_truck
-                + (1.0 - is_truck) * self.travel_price_drone
-            )
-            rent_vec = (
-                is_truck * self.rent_price_truck
-                + (1.0 - is_truck) * self.rent_price_drone
-            )
-            travel_part = (td["current_length"] * travel_vec).sum(dim=-1)
-            used = (td["current_length"] > 1e-8).to(dtype=travel_vec.dtype, device=travel_vec.device)
-            rent_part = (used * rent_vec).sum(dim=-1)
-
-            # --- Adaptive big-M: lambda_u > max possible (travel + rent) per instance ---
-            # Ensures visiting all customers is always strictly better than any feasible cost.
-            # Works for any N customers or map size without manual tuning.
-            rent_max = rent_vec.sum(dim=-1)                                    # [B] all vehicles used
-            all_locs = td["locs"]                                              # [B, M+N, 2]
-            bbox_diag = all_locs.max(dim=-2).values - all_locs.min(dim=-2).values  # [B, 2]
-            diameter_ub = bbox_diag.norm(dim=-1)                               # [B]
-            max_travel_price = travel_vec.max(dim=-1).values                   # [B]
-            travel_max = 2.0 * diameter_ub * num_customers * max_travel_price  # [B]
-            lambda_u = travel_max + rent_max + 1.0                             # [B]
-
-            # Priority 1 (hard): visit all customers
-            # Priority 2       : minimize money cost (travel + rent)
-            cost = lambda_u * unvisited_count + travel_part + rent_part
+            travel_cost, rent_cost = 0, 0
+            for m in range(num_agents):
+                travel_cost += td["current_length"][m]
+                rent_cost += (td["current_length"][m] > 0)
+            cost = alpha * (travel_cost * self.travel_price + rent_cost * self.rent_price) + beta * unvisited_count
         else:
             raise NotImplementedError(f"Invalid target: {self.target}")
         return -cost
@@ -677,10 +642,9 @@ class PVRPWDPVEnv(EpochDataEnvBase):
         # === Original depot isolation logic ===
         # The depot is not available if **all** the agents are at the depot and the task is not finished
         all_back_flag = torch.sum(td["current_node"] >= num_agents, dim=-1) == 0
-        done_flat = td["done"].squeeze(-1) if td["done"].dim() > 1 else td["done"]
-        has_finished_early = all_back_flag & ~done_flat
+        has_finished_early = all_back_flag & ~td["done"]
 
-        depot_mask = ~has_finished_early[..., None]  # [B, 1]; 1 means we can visit
+        depot_mask = ~has_finished_early[..., None]  # 1 means we can visit
 
         # If no available nodes outside (all visited), make the depot always available
         all_visited_flag = (

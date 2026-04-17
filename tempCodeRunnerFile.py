@@ -1,110 +1,93 @@
 """
-Script to read and inspect NPZ files from npz_test folder.
+Simple script to read and display NPZ file contents.
 """
 
 import numpy as np
 from pathlib import Path
 
-def inspect_npz_file(npz_path):
-    """
-    Load and inspect NPZ file structure and contents.
-    """
-    print(f"\n{'='*80}")
-    print(f"📦 Inspecting: {npz_path.name}")
-    print(f"{'='*80}")
-    
-    # Load NPZ file
-    data = np.load(npz_path)
-    
-    print(f"\n📋 Keys in NPZ file:")
-    for key in sorted(data.keys()):
-        print(f"   - {key}")
-    
-    print(f"\n📊 Data shapes:")
-    for key in sorted(data.keys()):
-        arr = data[key]
-        print(f"   {key:20s}: {str(arr.shape):20s} dtype: {arr.dtype}")
-    
-    print(f"\n📈 Statistics:")
-    batch_size = data['depot'].shape[0]
-    num_customers = data['locs'].shape[1]
-    num_vehicles = data['agents_speed'].shape[1]
-    
-    print(f"   Batch size: {batch_size} instances")
-    print(f"   Customers per instance: {num_customers}")
-    print(f"   Vehicles per instance: {num_vehicles}")
-    
-    print(f"\n🔍 Sample instance (batch[0]):")
-    
-    print(f"\n   Depot (coordinates):")
-    print(f"      {data['depot'][0]}")
-    
-    print(f"\n   First 5 customer locations:")
-    for i in range(min(5, num_customers)):
-        print(f"      Customer {i}: {data['locs'][0, i]}")
-    
-    print(f"\n   First 5 demands:")
-    print(f"      {data['demand'][0, :5]}")
-    
-    print(f"\n   First 5 time windows:")
-    for i in range(min(5, num_customers)):
-        print(f"      Customer {i}: {data['time_windows'][0, i]}")
-    
-    print(f"\n   Vehicle speeds:")
-    print(f"      {data['agents_speed'][0]}")
-    
-    print(f"\n   Vehicle capacities:")
-    print(f"      {data['agents_capacity'][0]}")
-    
-    print(f"\n   Vehicle endurance:")
-    print(f"      {data['agents_endurance'][0]}")
-    
-    print(f"\n   Waiting times (first 5):")
-    print(f"      {data['waiting_time'][0, :5]}")
-    
-    # Check for NaN values
-    print(f"\n⚠️  NaN/Inf Check:")
-    has_issues = False
-    for key in sorted(data.keys()):
-        arr = data[key]
-        nan_count = np.isnan(arr).sum()
-        inf_count = np.isinf(arr).sum()
-        if nan_count > 0 or inf_count > 0:
-            print(f"   ❌ {key}: {nan_count} NaN, {inf_count} Inf")
-            has_issues = True
-    
-    if not has_issues:
-        print(f"   ✅ No NaN/Inf values found!")
-    
-    # Close the npz file
-    data.close()
 
-
-def main():
+def read_npz_file(file_path, output_file=None):
     """
-    Main: scan folder and inspect all NPZ files.
+    Read and display information about an NPZ file.
+    
+    Args:
+        file_path (str or Path): Path to the NPZ file
+        output_file (str or Path): Optional path to save output to a text file
     """
-    npz_folder = Path("npz_test")
+    file_path = Path(file_path)
     
-    print(f"\n🔍 Scanning folder: {npz_folder.absolute()}")
-    
-    # Find all NPZ files
-    npz_files = sorted(npz_folder.glob("*.npz"))
-    
-    print(f"✅ Found {len(npz_files)} NPZ file(s)")
-    
-    if len(npz_files) == 0:
-        print("❌ No NPZ files found!")
+    if not file_path.exists():
+        error_msg = f"❌ File not found: {file_path}"
+        print(error_msg)
         return
     
-    # Inspect each NPZ file
-    for npz_file in npz_files:
-        inspect_npz_file(npz_file)
+    # Collect output lines
+    lines = []
+    lines.append(f"\n{'='*80}")
+    lines.append(f"📦 Reading NPZ file: {file_path.name}")
+    lines.append(f"{'='*80}\n")
     
-    print(f"\n{'='*80}")
-    print(f"✅ Inspection complete!")
-    print(f"{'='*80}\n")
+    # Load the NPZ file
+    data = np.load(file_path)
+    
+    # Display all keys
+    lines.append("🔑 Keys in file:")
+    for key in sorted(data.keys()):
+        lines.append(f"   - {key}")
+    
+    # Display shape and dtype for each array
+    lines.append(f"\n📊 Arrays info:")
+    for key in sorted(data.keys()):
+        arr = data[key]
+        lines.append(f"   {key:30s} | Shape: {str(arr.shape):20s} | dtype: {arr.dtype}")
+    
+    # Display sample data
+    lines.append(f"\n📈 Sample data (first 3 instances):")
+    
+    # Determine how many instances to show
+    first_arr = data[list(data.keys())[0]]
+    num_instances = first_arr.shape[0]
+    num_to_show = min(3, num_instances)
+    
+    for inst_idx in range(num_to_show):
+        lines.append(f"\n   === Instance {inst_idx} ===")
+        for key in sorted(data.keys()):
+            arr = data[key]
+            if arr.size > 0:
+                lines.append(f"   {key}:")
+                if arr.ndim == 1:
+                    lines.append(f"      {arr[inst_idx]}")  # Show single value or first N
+                else:
+                    lines.append(f"      shape={arr[inst_idx].shape}, sample={arr[inst_idx].flat[:5]}")  # Show shape + first 5 elements
+    
+    lines.append(f"\n{'='*80}\n")
+    
+    # Output to file or console
+    output_text = "\n".join(lines)
+    
+    if output_file:
+        output_file = Path(output_file)
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(output_file, "w", encoding="utf-8") as f:
+            f.write(output_text)
+        print(f"✅ Output saved to: {output_file}")
+    else:
+        print(output_text)
 
 
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    # Ví dụ: đọc file train
+    import sys
+    
+    # Nếu không truyền argument, sử dụng file mặc định
+    if len(sys.argv) > 1:
+        file_to_read = sys.argv[1]
+        output_txt = sys.argv[2] if len(sys.argv) > 2 else f"npz_info_{Path(file_to_read).stem}.txt"
+    else:
+        # Chọn một file từ các folder có sẵn
+        file_to_read = "data/train_data_npz/pvrpwdp_epoch_00.npz"
+        output_txt = "npz_info.txt"
+        # file_to_read = "data/old.npz"
+        # output_txt = "old.txt"
+    
+    read_npz_file(file_to_read, output_txt)
