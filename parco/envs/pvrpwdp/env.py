@@ -418,6 +418,29 @@ class PVRPWDPVEnv(EpochDataEnvBase):
         return td
 
     @staticmethod
+    def _truck_mask_from_capacity(capacity: torch.Tensor) -> torch.Tensor:
+        """Classify agents as trucks vs drones based on their capacity.
+
+        Returns a float mask with the same shape as `capacity` where entries
+        equal to 1.0 correspond to trucks (higher capacity) and 0.0 to drones
+        (lower capacity). The threshold is taken as the midpoint between the
+        max and min capacity along the agent axis (last dim), computed
+        per-batch, which matches the convention used in the GA solvers.
+
+        Args:
+            capacity: Tensor of shape [..., M] (typically [B, M]) containing
+                each agent's capacity.
+
+        Returns:
+            Float tensor with the same shape/dtype/device as `capacity` where
+            truck entries are 1.0 and drone entries are 0.0.
+        """
+        cap_max = capacity.max(dim=-1, keepdim=True).values
+        cap_min = capacity.min(dim=-1, keepdim=True).values
+        thresh = 0.5 * (cap_max + cap_min)
+        return (capacity > (thresh + 1e-6)).to(capacity.dtype)
+
+    @staticmethod
     def _compute_operating_time(td: TensorDict, actions: torch.Tensor) -> torch.Tensor:
         """Replay action sequence to compute total operating time per agent.
 

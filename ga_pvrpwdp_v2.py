@@ -15,6 +15,7 @@ Example with 3 vehicles:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import csv
 import math
 import random
@@ -27,17 +28,65 @@ import torch
 from rl4co.data.utils import load_npz_to_tensordict
 
 from parco.envs.pvrpwdp import PVRPWDPVEnv
+# NOTE: v1's DecodedSolution uses `routes`, v2 uses `states` + `VehicleState`.
+# v1 also does NOT define VehicleState. Therefore v2 defines its own dataclasses
+# below and only imports the runner/utility helpers that are truly shared.
 from ga_pvrpwdp import (
-    VehicleState,
-    DecodedSolution,
     InstanceResult,
     format_progress,
+    load_instance,
     load_instance_from_td,
     save_results_csv,
     summarize_results,
 )
 
 SEP = -1
+
+
+@dataclass
+class VehicleState:
+    """Mutable per-vehicle state used by the separator decoder."""
+    vehicle_id: int
+    depot_idx: int
+    speed: float
+    capacity: float
+    endurance: float
+    max_time: float
+    current_node: int
+    trip_deadline: float
+    current_length: float = 0.0
+    current_time: float = 0.0
+    used_capacity: float = 0.0
+    used_endurance: float = 0.0
+    route_actions: list[int] = field(default_factory=list)
+
+    def clone(self) -> "VehicleState":
+        return VehicleState(
+            vehicle_id=self.vehicle_id,
+            depot_idx=self.depot_idx,
+            speed=self.speed,
+            capacity=self.capacity,
+            endurance=self.endurance,
+            max_time=self.max_time,
+            current_node=self.current_node,
+            trip_deadline=self.trip_deadline,
+            current_length=self.current_length,
+            current_time=self.current_time,
+            used_capacity=self.used_capacity,
+            used_endurance=self.used_endurance,
+            route_actions=list(self.route_actions),
+        )
+
+
+@dataclass
+class DecodedSolution:
+    """v2 decoded solution: keeps full per-vehicle state instead of flat routes."""
+    states: list[VehicleState]
+    unserved_customers: list[int]
+    score: float
+    makespan: float
+    total_distance: float
+    total_cost: float
 
 
 class SeparatorPVRPWDPSolver:
@@ -53,19 +102,34 @@ class SeparatorPVRPWDPSolver:
         self.max_time = float(td_reset["max_time"][0].item())
 
         self.locs = td_reset["locs"][0].cpu().numpy()
-        self.customer_demands = td_reset["demand"][0, 0, self.num_agents:].cpu().numpy()
+        # demand is [B, m+N] (2D), not [B, m, m+N]. Index with [0, num_agents:].
+        self.customer_demands = td_reset["demand"][0, self.num_agents:].cpu().numpy()
         self.time_windows = td_reset["time_window"][0, self.num_agents:, :].cpu().numpy()
         self.waiting_time = td_reset["waiting_time"][0, self.num_agents:].cpu().numpy()
-        self.agents_speed = td_reset["agents_speed"][0].cpu().numpy()
+        # Guard against any residual zero-speed agents to avoid divide-by-zero / NaN.
+        self.agents_speed = np.maximum(
+            td_reset["agents_speed"][0].cpu().numpy(), 1e-9
+        )
         self.agents_capacity = td_reset["agents_capacity"][0].cpu().numpy()
         self.agents_endurance = td_reset["agents_endurance"][0].cpu().numpy()
         self.customer_env_indices = np.arange(self.num_agents, self.num_agents + self.num_customers)
 
         is_truck = self._truck_mask_from_capacity(self.agents_capacity)
-        self.travel_price = np.where(is_truck, float(env.travel_price_truck), float(env.travel_price_drone))
-        self.rent_price = np.where(is_truck, float(env.rent_price_truck), float(env.rent_price_drone))
+        self.is_truck = is_truck
+        # Use getattr with sensible defaults in case the env doesn't expose these
+        # attributes (matches v1's defensive style).
+        self.travel_price = np.where(
+            is_truck,
+            float(getattr(env, "travel_price_truck", 0.35 / 1000)),
+            float(getattr(env, "travel_price_drone", 1.5 / 3600)),
+        )
+        self.rent_price = np.where(
+            is_truck,
+            float(getattr(env, "rent_price_truck", 40.0)),
+            float(getattr(env, "rent_price_drone", 10.0)),
+        )
 
-        bbox_diag = np.linalg.norm(self.locs.max(axis=0) - self.locs.min(axis=0))
+        bbox_diag = float(np.linalg.norm(self.locs.max(axis=0) - self.locs.min(axis=0)))
         travel_max = 2.0 * bbox_diag * self.num_customers * float(self.travel_price.max())
         self.lambda_unserved = travel_max + float(self.rent_price.sum()) + 1.0
         latest_max = float(self.time_windows[:, 1].max())
@@ -659,6 +723,66 @@ def run_single_instance(
     )
 
 
+def worker_run_single_instance(
+    npz_path: str,
+    batch_idx: int,
+    target: str,
+    population: int,
+    generations: int,
+    mutation_rate: float,
+    elite_size: int,
+    tournament_size: int,
+    cull_ratio: float,
+    immigrant_ratio: float,
+    local_search_rate: float,
+    local_search_elites: int,
+    local_search_iters: int,
+    seed: int,
+    show_routes: bool,
+    show_generation_progress: bool,
+    generation_progress_every: int,
+) -> InstanceResult:
+    """Worker cho ProcessPoolExecutor: mỗi tiến trình tự load data riêng."""
+    env, td_raw, td_reset = load_instance(npz_path, batch_idx, target)
+    solver = SeparatorPVRPWDPSolver(env=env, td_raw=td_raw, td_reset=td_reset)
+    best = solver.run(
+        population_size=population,
+        generations=generations,
+        mutation_rate=mutation_rate,
+        elite_size=elite_size,
+        tournament_size=tournament_size,
+        cull_ratio=cull_ratio,
+        immigrant_ratio=immigrant_ratio,
+        local_search_rate=local_search_rate,
+        local_search_elites=local_search_elites,
+        local_search_iters=local_search_iters,
+        seed=seed,
+        verbose=show_generation_progress,
+        progress_label=f"{target}|b={batch_idx:03d}",
+        progress_every=generation_progress_every,
+    )
+    env_eval = solver.evaluate_with_env(best)
+
+    if show_routes:
+        print(f"\n[target={target}] batch={batch_idx}")
+        solver.print_solution(best)
+
+    return InstanceResult(
+        target=target,
+        batch_idx=batch_idx,
+        score=float(best.score),
+        objective_cost=float(env_eval["objective_cost"]),
+        objective_reward=float(env_eval["objective_reward"]),
+        raw_env_reward=float(env_eval["raw_env_reward"]),
+        unserved=len(best.unserved_customers),
+        visited_customers=int(env_eval["visited_customers"]),
+        done=int(env_eval["done"]),
+        makespan=float(best.makespan),
+        total_distance=float(best.total_distance),
+        total_cost=float(best.total_cost),
+    )
+
+
 def run_target_over_dataset(
     npz_path: str,
     target: str,
@@ -679,6 +803,7 @@ def run_target_over_dataset(
     show_routes: bool,
     show_generation_progress: bool,
     generation_progress_every: int,
+    max_workers: int = 1,
 ) -> list[InstanceResult]:
     td_loaded = load_npz_to_tensordict(npz_path)
     total_batches = int(td_loaded.batch_size[0])
@@ -692,38 +817,90 @@ def run_target_over_dataset(
     results: list[InstanceResult] = []
     start_time = time.time()
 
-    print(f"\n=== [v2-separator] Running target={target} on {len(batch_indices)}/{total_batches} instances ===")
-    for order_idx, idx in enumerate(batch_indices, start=1):
-        instance_seed = seed + idx + (0 if target == "mincost" else 10_000)
-        result = run_single_instance(
-            td_loaded=td_loaded,
-            batch_idx=idx,
-            target=target,
-            population=population,
-            generations=generations,
-            mutation_rate=mutation_rate,
-            elite_size=elite_size,
-            tournament_size=tournament_size,
-            cull_ratio=cull_ratio,
-            immigrant_ratio=immigrant_ratio,
-            local_search_rate=local_search_rate,
-            local_search_elites=local_search_elites,
-            local_search_iters=local_search_iters,
-            seed=instance_seed,
-            show_routes=show_routes and len(batch_indices) == 1,
-            show_generation_progress=show_generation_progress,
-            generation_progress_every=generation_progress_every,
-        )
-        results.append(result)
-        print(
-            f"[{target}] {format_progress(order_idx, len(batch_indices), start_time)} "
-            f"batch={idx:03d} "
-            f"objective_cost={result.objective_cost:.4f} "
-            f"score={result.score:.4f} "
-            f"unserved={result.unserved} "
-            f"makespan={result.makespan:.4f} "
-            f"done={result.done}"
-        )
+    print(
+        f"\n=== [v2-separator] Running target={target} on "
+        f"{len(batch_indices)}/{total_batches} instances (Workers: {max_workers}) ==="
+    )
+
+    if max_workers <= 1 or len(batch_indices) == 1:
+        # Chạy tuần tự trong cùng tiến trình: tái sử dụng td_loaded đã nạp sẵn.
+        for order_idx, idx in enumerate(batch_indices, start=1):
+            instance_seed = seed + idx + (0 if target == "mincost" else 10_000)
+            result = run_single_instance(
+                td_loaded=td_loaded,
+                batch_idx=idx,
+                target=target,
+                population=population,
+                generations=generations,
+                mutation_rate=mutation_rate,
+                elite_size=elite_size,
+                tournament_size=tournament_size,
+                cull_ratio=cull_ratio,
+                immigrant_ratio=immigrant_ratio,
+                local_search_rate=local_search_rate,
+                local_search_elites=local_search_elites,
+                local_search_iters=local_search_iters,
+                seed=instance_seed,
+                show_routes=show_routes and len(batch_indices) == 1,
+                show_generation_progress=show_generation_progress,
+                generation_progress_every=generation_progress_every,
+            )
+            results.append(result)
+            print(
+                f"[{target}] {format_progress(order_idx, len(batch_indices), start_time)} "
+                f"batch={idx:03d} "
+                f"objective_cost={result.objective_cost:.4f} "
+                f"score={result.score:.4f} "
+                f"unserved={result.unserved} "
+                f"makespan={result.makespan:.4f} "
+                f"done={result.done}"
+            )
+    else:
+        # Chạy song song: mỗi worker tự load npz của nó, tránh pickle tensordict.
+        with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+            futures = {}
+            for idx in batch_indices:
+                instance_seed = seed + idx + (0 if target == "mincost" else 10_000)
+                future = executor.submit(
+                    worker_run_single_instance,
+                    npz_path,
+                    idx,
+                    target,
+                    population,
+                    generations,
+                    mutation_rate,
+                    elite_size,
+                    tournament_size,
+                    cull_ratio,
+                    immigrant_ratio,
+                    local_search_rate,
+                    local_search_elites,
+                    local_search_iters,
+                    instance_seed,
+                    show_routes and len(batch_indices) == 1,
+                    show_generation_progress,
+                    generation_progress_every,
+                )
+                futures[future] = idx
+
+            for order_idx, future in enumerate(
+                concurrent.futures.as_completed(futures), start=1
+            ):
+                idx = futures[future]
+                try:
+                    result = future.result()
+                    results.append(result)
+                    print(
+                        f"[{target}] {format_progress(order_idx, len(batch_indices), start_time)} "
+                        f"batch={idx:03d} "
+                        f"objective_cost={result.objective_cost:.4f} "
+                        f"score={result.score:.4f} "
+                        f"unserved={result.unserved} "
+                        f"makespan={result.makespan:.4f} "
+                        f"done={result.done}"
+                    )
+                except Exception as exc:
+                    print(f"Batch {idx} generated an exception: {exc}")
 
     summary = summarize_results(results, target)
     print(f"\nSummary for target={target} (v2-separator)")
@@ -751,10 +928,10 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="GA v2 (separator encoding) for PVRPWDP.")
     parser.add_argument("--npz", required=True)
     parser.add_argument("--batch-idx", type=int, default=None)
-    parser.add_argument("--num-batches", type=int, default=None)
+    parser.add_argument("--num-batches", type=int, default=5)
     parser.add_argument("--target", choices=["makespan", "mincost", "both"], default="both")
-    parser.add_argument("--population", type=int, default=80)
-    parser.add_argument("--generations", type=int, default=100)
+    parser.add_argument("--population", type=int, default=100)
+    parser.add_argument("--generations", type=int, default=400)
     parser.add_argument("--mutation-rate", type=float, default=0.1)
     parser.add_argument("--elite-size", type=int, default=4)
     parser.add_argument("--tournament-size", type=int, default=5)
@@ -762,12 +939,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--immigrant-ratio", type=float, default=0.05)
     parser.add_argument("--local-search-rate", type=float, default=0.15)
     parser.add_argument("--local-search-elites", type=int, default=2)
-    parser.add_argument("--local-search-iters", type=int, default=15)
+    parser.add_argument("--local-search-iters", type=int, default=20)
     parser.add_argument("--show-generation-progress", action="store_true")
-    parser.add_argument("--generation-progress-every", type=int, default=10)
+    parser.add_argument("--generation-progress-every", type=int, default=100)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-dir", type=str, default=None)
     parser.add_argument("--show-routes", action="store_true")
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=5,
+        help="Số nhân CPU sử dụng để chạy các batch song song (>=2 để bật ProcessPoolExecutor).",
+    )
     return parser.parse_args()
 
 
@@ -797,6 +980,7 @@ def main() -> None:
             show_routes=args.show_routes,
             show_generation_progress=args.show_generation_progress,
             generation_progress_every=args.generation_progress_every,
+            max_workers=args.max_workers,
         )
 
     if len(targets) == 2:
