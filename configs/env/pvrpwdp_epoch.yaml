@@ -1,0 +1,34 @@
+# @package _global_
+
+# PVRPWDP Environment with Epoch-based Data Loading
+# This config enables loading pre-generated training data from epoch files
+
+defaults:
+  - pvrpwdp.yaml  # Inherit from base PVRPWDP config
+
+# Override to use epoch data loading
+env:
+  _target_: parco.envs.pvrpwdp.env.PVRPWDPVEnv
+  
+  # Epoch data configuration
+  epoch_data_dir: "data/pvrpwdp/train_epochs/"  # Directory containing epoch files
+  epoch_file_pattern: "epoch_{epoch}.npz"        # File naming pattern
+  use_epoch_data: true                           # Enable epoch data loading
+  fallback_to_generator: true                    # Use generator if epoch file missing
+  
+  # Generator params (for fallback and val/test)
+  generator_params:
+    num_loc: 20
+    min_loc: 20
+    max_loc: 20
+    num_agents: 3
+    min_agents: 3
+    max_agents: 3
+    min_demand: 1
+    max_demand: 10
+    capacity: 40.0
+    endurance: 10.0
+    speed: 1.0
+    drone_speed: 2.0
+    tw_expansion: 3.0
+    freshness_factor: 2.0

@@ -9,11 +9,24 @@ outputs/
 
 # Checkpoints
 checkpoints/
+my_checkpoints/
+*.ckpt
+*.pth
 
+# logs
+csv_logs/
+
+docs/
+literature/
 
 #cache
 cache/
+.ruff_cache/
 
+base_copy.py
+paper-kool-hgs-vrptw.pdf
+tempCodeRunnerFile.py
+implementation_plan.md
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -141,7 +154,7 @@ celerybeat.pid
 .venv
 /env
 venv/
-ENV/
+/ENV/
 env.bak/
 venv.bak/
 
