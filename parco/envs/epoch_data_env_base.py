@@ -11,7 +11,7 @@ Key Features:
 
 File Naming Convention:
     - Default pattern: "epoch_{epoch:02d}_{part:02d}.npz"
-    - Examples: 
+    - Examples:
         * "epoch_00_00.npz", "epoch_00_01.npz" (Epoch 0 parts)
         * "epoch_01_00.npz", "epoch_01_01.npz" (Epoch 1 parts)
 """
@@ -32,17 +32,30 @@ from rl4co.utils.pylogger import get_pylogger
 
 log = get_pylogger(__name__)
 
+
 class MultiPartLazyDataset(torch.utils.data.Dataset):
     """
     Dataset giữ các part của 1 Epoch duy nhất.
     Nạp/xả từng part lên RAM để không bị tràn bộ nhớ.
     """
+
     def __init__(self, epoch, part_files, samples_per_file):
         self.epoch = epoch
         self.part_files = sorted(part_files)
         self.samples_per_file = samples_per_file
-        self.total_samples = len(self.part_files) * samples_per_file
-        
+
+        # Add DDP awareness
+        if torch.distributed.is_initialized():
+            self.rank = torch.distributed.get_rank()
+            self.world_size = torch.distributed.get_world_size()
+        else:
+            self.rank = 0
+            self.world_size = 1
+
+        # We must shard PER PART to ensure ALL GPUs load the SAME part file at the same time
+        self.local_length = self.samples_per_file // self.world_size
+        self.total_samples = len(self.part_files) * self.local_length
+
         self.current_part_idx = -1
         self.current_td = None
 
@@ -50,22 +63,44 @@ class MultiPartLazyDataset(torch.utils.data.Dataset):
         return self.total_samples
 
     def __getitem__(self, idx):
-        part_idx = idx // self.samples_per_file
-        item_idx = idx % self.samples_per_file
+        # Find which part this idx belongs to
+        part_idx_seq = idx // self.local_length
+        local_idx_in_part = idx % self.local_length
+
+        # Convert local index -> global index
+        global_idx = (
+            (part_idx_seq * self.samples_per_file)
+            + local_idx_in_part
+            + (self.rank * self.local_length)
+        )
+
+        # Compute exact part and item index
+        part_idx = global_idx // self.samples_per_file
+        item_idx = global_idx % self.samples_per_file
 
         if self.current_part_idx != part_idx:
             file_path = self.part_files[part_idx]
             file_name = os.path.basename(file_path)
-            log.info(f"🔄 [Epoch {self.epoch:02d}] - Giải phóng RAM & Nạp Part {part_idx:02d}: {file_name}")
-            
+            log.info(
+                f"[Epoch {self.epoch:02d} | Rank {self.rank}] - Giải phóng RAM & Nạp Part {part_idx:02d}: {file_name}"
+            )
+
             self.current_td = load_npz_to_tensordict(file_path)
             self.current_part_idx = part_idx
 
+            # Debugging: Print rank, part_idx, global_idx
+            print(
+                f"Debug -> rank: {self.rank}, part_idx: {part_idx}, global_idx: {global_idx}"
+            )
+
         return self.current_td[item_idx]
+
+    def collate_fn(self, batch):
+        return torch.stack(batch)
 
 
 class EpochDataEnvBase(RL4COEnvBase):
-    
+
     def __init__(
         self,
         *,
@@ -76,15 +111,15 @@ class EpochDataEnvBase(RL4COEnvBase):
         **kwargs,
     ):
         super().__init__(**kwargs)
-        
+
         self.epoch_data_dir = epoch_data_dir
         self.epoch_file_pattern = epoch_file_pattern
         self.use_epoch_data = use_epoch_data
         self.fallback_to_generator = fallback_to_generator
-        
+
         self.current_epoch = 0
         self.max_epochs = None
-        
+
         if self.use_epoch_data:
             if self.epoch_data_dir is None:
                 log.warning("use_epoch_data=True but epoch_data_dir is None. Disabled.")
@@ -92,110 +127,128 @@ class EpochDataEnvBase(RL4COEnvBase):
             else:
                 epoch_data_path = Path(self.epoch_data_dir)
                 if not epoch_data_path.exists() or not epoch_data_path.is_dir():
-                    log.warning(f"Epoch data directory '{self.epoch_data_dir}' is invalid/missing.")
+                    log.warning(
+                        f"Epoch data directory '{self.epoch_data_dir}' is invalid/missing."
+                    )
                     self.use_epoch_data = False
 
     def dataset(self, batch_size=[], phase="train", filename=None):
         if phase != "train":
             return super().dataset(batch_size, phase, filename)
-        
+
         # 1. Tìm tất cả các file part của epoch hiện tại
-        pattern_with_epoch = self.epoch_file_pattern.replace("{epoch:02d}", f"{self.current_epoch:02d}")
+        pattern_with_epoch = self.epoch_file_pattern.replace(
+            "{epoch:02d}", f"{self.current_epoch:02d}"
+        )
         search_pattern = pattern_with_epoch.replace("{part:02d}", "*")
-        
+
         search_path = os.path.join(self.epoch_data_dir, search_pattern)
-        part_files = glob.glob(search_path)
-        
+        part_files = sorted(glob.glob(search_path))
+
         if not part_files or not self.use_epoch_data:
             error_msg = f"❌ LỖI CHÍ MẠNG: Không tìm thấy bất kỳ file nào cho Epoch {self.current_epoch} với định dạng '{search_pattern}'"
             log.error(error_msg)
             raise FileNotFoundError(error_msg)
-            
-        # ---------- THÔNG SỐ QUAN TRỌNG TỪ FILE GENERATOR ----------
-        SAMPLES_PER_FILE = 20480  
-        # -----------------------------------------------------------
-        
-        log.info(f"🚀 Epoch {self.current_epoch:02d}: Gom {len(part_files)} file parts. Tổng: {len(part_files)*SAMPLES_PER_FILE} mẫu.")
+
+        # Detect samples per file from the first part
+        first_td = load_npz_to_tensordict(part_files[0])
+        SAMPLES_PER_FILE = len(first_td)
+        del first_td
+
+        log.info(
+            f"Epoch {self.current_epoch:02d}: {len(part_files)} parts x {SAMPLES_PER_FILE} samples = {len(part_files)*SAMPLES_PER_FILE} total."
+        )
         return MultiPartLazyDataset(self.current_epoch, part_files, SAMPLES_PER_FILE)
 
     def list_available_epochs(self) -> list:
         """Đã được nâng cấp để đọc format epoch_ab_cd.npz"""
         if self.epoch_data_dir is None or not os.path.exists(self.epoch_data_dir):
             return []
-        
+
         # Tìm tất cả file có chữ epoch_
-        search_pattern = self.epoch_file_pattern.replace("{epoch:02d}", "*").replace("{part:02d}", "*")
-        files = glob.glob(os.path.join(self.epoch_data_dir, search_pattern))
-        
+        search_pattern = self.epoch_file_pattern.replace("{epoch:02d}", "*").replace(
+            "{part:02d}", "*"
+        )
+        files = sorted(glob.glob(os.path.join(self.epoch_data_dir, search_pattern)))
+
         epochs = set()
         for file_path in files:
             filename = os.path.basename(file_path)
             # Dùng regex để bắt đúng cái số ab trong epoch_ab_cd
-            match = re.search(r'epoch_(\d+)_', filename)
+            match = re.search(r"epoch_(\d+)_", filename)
             if match:
                 epochs.add(int(match.group(1)))
-                
+
         return sorted(list(epochs))
 
     def validate_epoch_files(self, max_epoch: Optional[int] = None) -> dict:
         """Kiểm tra xem mỗi epoch có ít nhất 1 part hợp lệ không"""
         if max_epoch is None:
             max_epoch = self.max_epochs if self.max_epochs is not None else 100
-        
+
         results = {
-            'missing': [],
-            'corrupted': [],
-            'valid': [],
-            'total_expected': max_epoch
+            "missing": [],
+            "corrupted": [],
+            "valid": [],
+            "total_expected": max_epoch,
         }
-        
+
         for epoch in range(max_epoch):
-            pattern_with_epoch = self.epoch_file_pattern.replace("{epoch:02d}", f"{epoch:02d}")
+            pattern_with_epoch = self.epoch_file_pattern.replace(
+                "{epoch:02d}", f"{epoch:02d}"
+            )
             search_pattern = pattern_with_epoch.replace("{part:02d}", "*")
-            part_files = glob.glob(os.path.join(self.epoch_data_dir, search_pattern))
-            
+            part_files = sorted(
+                glob.glob(os.path.join(self.epoch_data_dir, search_pattern))
+            )
+
             if not part_files:
-                results['missing'].append(epoch)
+                results["missing"].append(epoch)
             else:
                 try:
                     # Test load part đầu tiên để xem file có bị lỗi (corrupted) không
                     td = load_npz_to_tensordict(part_files[0])
-                    results['valid'].append(epoch)
+                    results["valid"].append(epoch)
                 except Exception as e:
                     log.warning(f"Corrupted file in epoch {epoch}: {str(e)}")
-                    results['corrupted'].append(epoch)
-        
+                    results["corrupted"].append(epoch)
+
         return results
 
     def print_epoch_data_info(self):
         """Giữ nguyên hàm print debug gốc của bạn"""
-        print("\n" + "="*60)
+        print("\n" + "=" * 60)
         print("EPOCH DATA CONFIGURATION")
-        print("="*60)
+        print("=" * 60)
         print(f"Epoch Data Directory: {self.epoch_data_dir}")
         print(f"File Pattern:         {self.epoch_file_pattern}")
         print(f"Use Epoch Data:       {self.use_epoch_data}")
         print(f"Fallback to Generator: {self.fallback_to_generator}")
         print(f"Current Epoch:        {self.current_epoch}")
         print(f"Max Epochs:           {self.max_epochs}")
-        
+
         if self.use_epoch_data and self.epoch_data_dir:
             available_epochs = self.list_available_epochs()
             print(f"\nAvailable Epochs:     {len(available_epochs)}")
             if available_epochs:
-                print(f"Epoch Range:          {min(available_epochs)} - {max(available_epochs)}")
-                
+                print(
+                    f"Epoch Range:          {min(available_epochs)} - {max(available_epochs)}"
+                )
+
                 if len(available_epochs) <= 10:
                     print(f"Epochs:               {available_epochs}")
                 else:
-                    print(f"Sample Epochs:        {available_epochs[:5]} ... {available_epochs[-5:]}")
-                
+                    print(
+                        f"Sample Epochs:        {available_epochs[:5]} ... {available_epochs[-5:]}"
+                    )
+
                 if self.current_epoch in available_epochs:
                     print(f"✅ Current epoch {self.current_epoch} files exist")
                 else:
                     print(f"⚠️  Current epoch {self.current_epoch} files NOT FOUND")
-        
-        print("="*60 + "\n")
+
+        print("=" * 60 + "\n")
+
 
 # Example usage and testing
 if __name__ == "__main__":

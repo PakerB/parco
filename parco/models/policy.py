@@ -62,6 +62,7 @@ class PARCOPolicy(nn.Module):
         sdpa_fn_decoder: (
             Callable | str
         ) = "simple",  # SDPA function for decoder, simple is JIC https://github.com/ai4co/rl4co/issues/228
+        decoder_kwargs: dict = {},  # Extra kwargs forwarded to PARCODecoder (e.g. attention_injection_mode)
     ):
         super(PARCOPolicy, self).__init__()
 
@@ -108,6 +109,7 @@ class PARCOPolicy(nn.Module):
                 env_name=self.env_name,
                 use_pos_token=use_pos_token,
                 sdpa_fn=sdpa_fn_decoder,
+                **decoder_kwargs,
             )
         else:
             log.warning("Using custom decoder")
