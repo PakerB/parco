@@ -41,6 +41,7 @@ class CustomPARCORLModule(PARCORLModule):
 
         # Giai phong dataset cu
         import gc
+
         if hasattr(self, "train_dataset") and self.train_dataset is not None:
             del self.train_dataset
             self.train_dataset = None
@@ -60,11 +61,21 @@ class CustomPARCORLModule(PARCORLModule):
             collate_fn=dl_old.collate_fn,
         )
 
+    def _get_distributed_sampler(self, dataset):
+        """Create DistributedSampler for val/test when DDP is active."""
+        if torch.distributed.is_initialized():
+            from torch.utils.data.distributed import DistributedSampler
+
+            return DistributedSampler(dataset, shuffle=False)
+        return None
+
     def val_dataloader(self):
         dl_old = super().val_dataloader()
+        sampler = self._get_distributed_sampler(dl_old.dataset)
         return DataLoader(
             dl_old.dataset,
             batch_size=self._batch_size,
+            sampler=sampler,
             shuffle=False,
             drop_last=True,
             num_workers=0,
@@ -74,9 +85,11 @@ class CustomPARCORLModule(PARCORLModule):
 
     def test_dataloader(self):
         dl_old = super().test_dataloader()
+        sampler = self._get_distributed_sampler(dl_old.dataset)
         return DataLoader(
             dl_old.dataset,
             batch_size=self._batch_size,
+            sampler=sampler,
             shuffle=False,
             drop_last=True,
             num_workers=0,
@@ -195,7 +208,7 @@ if __name__ == "__main__":
             find_unused_parameters=True, timeout=timedelta(seconds=5400)
         ),
         precision="bf16-mixed",
-        accumulate_grad_batches=4,
+        # accumulate_grad_batches=4,
         reload_dataloaders_every_n_epochs=1,
         use_distributed_sampler=False,
         logger=csv_logger,
