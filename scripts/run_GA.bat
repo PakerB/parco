@@ -1,0 +1,30 @@
+python ga_pvrpwdp_v2.py \
+  --npz path/to/your/data.npz \
+  --batch-idx 0 \
+  --num-batches 5 \
+  --offset 1 \
+  --target both \
+  --population 100 \
+  --generations 400 \
+  --mutation-rate 0.1 \
+  --elite-size 4 \
+  --tournament-size 5 \
+  --cull-ratio 0.5 \
+  --immigrant-ratio 0.05 \
+  --local-search-rate 0.15 \
+  --local-search-elites 2 \
+  --local-search-iters 20 \
+  --intensification-rate 0.15 \
+  --intensified-trials 8 \
+  --time-warp-search \
+  --infeasible-pool-ratio 0.4 \
+  --time-warp-penalty 100.0 \
+  --time-warp-target-feasible 0.2 \
+  --time-warp-adapt-every 100 \
+  --time-warp-booster 2.0 \
+  --show-generation-progress \
+  --generation-progress-every 100 \
+  --seed 42 \
+  --output-dir ./results \
+  --show-routes \
+  --max-workers 5

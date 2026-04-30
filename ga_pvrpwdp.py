@@ -51,10 +51,25 @@ class InstanceResult:
 class BasicPVRPWDPSolver:
     """GA baseline: Optimized with 1D Arrays and Distance Matrix."""
 
-    def __init__(self, env: PVRPWDPVEnv, td_raw: torch.Tensor, td_reset: torch.Tensor):
+    RANK_STRATEGIES = ("legacy", "serve-max")
+
+    def __init__(
+        self,
+        env: PVRPWDPVEnv,
+        td_raw: torch.Tensor,
+        td_reset: torch.Tensor,
+        rank_strategy: str = "legacy",
+    ):
+        if rank_strategy not in self.RANK_STRATEGIES:
+            raise ValueError(
+                f"rank_strategy must be one of {self.RANK_STRATEGIES}, "
+                f"got {rank_strategy!r}"
+            )
+
         self.env = env
         self.td_raw = td_raw
         self.td_reset = td_reset
+        self.rank_strategy = rank_strategy
 
         self.num_agents = int(td_reset["current_node"].shape[-1])
         self.num_customers = int(td_reset["locs"].shape[-2] - self.num_agents)
@@ -116,6 +131,190 @@ class BasicPVRPWDPSolver:
         thresh = 0.5 * (capacity.max() + capacity.min())
         return capacity > (thresh + 1e-6)
 
+    def _can_append_customer_from_state(
+        self,
+        vehicle_id: int,
+        start_node: int,
+        start_time: float,
+        used_capacity: float,
+        used_endurance: float,
+        trip_deadline: float,
+        customer_id: int,
+    ) -> bool:
+        customer_idx = int(self.customer_env_indices[customer_id])
+        demand = float(self.customer_demands[customer_id])
+        capacity = float(self.agents_capacity[vehicle_id])
+        if used_capacity + demand > capacity + 1e-9:
+            return False
+
+        speed = float(self.agents_speed[vehicle_id])
+        travel_dist = float(self.dist_matrix[start_node, customer_idx])
+        travel_time = travel_dist / speed
+        arrival = start_time + travel_time
+        earliest, latest = self.time_windows[customer_id]
+        service_time = max(arrival, float(earliest))
+        if service_time > float(latest) + 1e-9:
+            return False
+
+        wait_mid = 0.0
+        if start_node != vehicle_id:
+            wait_mid = max(float(earliest) - arrival, 0.0)
+
+        new_used_endurance = used_endurance + travel_time + wait_mid
+        back_time = float(self.dist_matrix[customer_idx, vehicle_id]) / speed
+        return_time = service_time + back_time
+        new_deadline = min(
+            trip_deadline, service_time + float(self.waiting_time[customer_id])
+        )
+        endurance = float(self.agents_endurance[vehicle_id])
+        return (
+            return_time <= new_deadline + 1e-9
+            and new_used_endurance + back_time <= endurance + 1e-9
+        )
+
+    def _customer_reachable_after_state(
+        self,
+        customer_id: int,
+        c_node: np.ndarray,
+        c_time: np.ndarray,
+        u_cap: np.ndarray,
+        u_end: np.ndarray,
+        t_dead: np.ndarray,
+    ) -> bool:
+        for vehicle_id in range(self.num_agents):
+            if self._can_append_customer_from_state(
+                vehicle_id=vehicle_id,
+                start_node=int(c_node[vehicle_id]),
+                start_time=float(c_time[vehicle_id]),
+                used_capacity=float(u_cap[vehicle_id]),
+                used_endurance=float(u_end[vehicle_id]),
+                trip_deadline=float(t_dead[vehicle_id]),
+                customer_id=customer_id,
+            ):
+                return True
+
+            if int(c_node[vehicle_id]) == vehicle_id:
+                continue
+
+            speed = float(self.agents_speed[vehicle_id])
+            close_time = float(self.dist_matrix[c_node[vehicle_id], vehicle_id]) / speed
+            reset_time = float(c_time[vehicle_id]) + close_time
+            if self._can_append_customer_from_state(
+                vehicle_id=vehicle_id,
+                start_node=vehicle_id,
+                start_time=reset_time,
+                used_capacity=0.0,
+                used_endurance=0.0,
+                trip_deadline=self.max_time,
+                customer_id=customer_id,
+            ):
+                return True
+
+        return False
+
+    def _reachable_customer_count(
+        self,
+        customer_ids: tuple[int, ...],
+        c_node: np.ndarray,
+        c_time: np.ndarray,
+        u_cap: np.ndarray,
+        u_end: np.ndarray,
+        t_dead: np.ndarray,
+    ) -> int:
+        reachable = 0
+        for customer_id in customer_ids:
+            if self._customer_reachable_after_state(
+                int(customer_id), c_node, c_time, u_cap, u_end, t_dead
+            ):
+                reachable += 1
+        return reachable
+
+    def _candidate_added_cost(
+        self,
+        vehicle_id: int,
+        current_length: float,
+        distance_delta: float,
+        operating_delta: float,
+    ) -> float:
+        metric_delta = distance_delta if self.is_truck[vehicle_id] else operating_delta
+        marginal_rent = (
+            0.0 if current_length > 1e-8 else float(self.rent_price[vehicle_id])
+        )
+        return float(metric_delta * self.travel_price[vehicle_id] + marginal_rent)
+
+    def _candidate_rank(
+        self,
+        vehicle_id: int,
+        service_time: float,
+        return_time: float,
+        distance_delta: float,
+        operating_delta: float,
+        back_time: float,
+        next_node: int,
+        next_time: float,
+        next_capacity: float,
+        next_endurance: float,
+        next_deadline: float,
+        time_window_slack: float,
+        remaining_customer_ids: tuple[int, ...],
+        c_node: np.ndarray,
+        c_time: np.ndarray,
+        c_length: np.ndarray,
+        u_cap: np.ndarray,
+        u_end: np.ndarray,
+        t_dead: np.ndarray,
+    ) -> tuple[float, ...]:
+        if self.rank_strategy == "legacy":
+            return (return_time, distance_delta, service_time)
+
+        next_c_node = c_node.copy()
+        next_c_time = c_time.copy()
+        next_u_cap = u_cap.copy()
+        next_u_end = u_end.copy()
+        next_t_dead = t_dead.copy()
+
+        next_c_node[vehicle_id] = next_node
+        next_c_time[vehicle_id] = next_time
+        next_u_cap[vehicle_id] = next_capacity
+        next_u_end[vehicle_id] = next_endurance
+        next_t_dead[vehicle_id] = next_deadline
+
+        reachable_after = self._reachable_customer_count(
+            remaining_customer_ids,
+            next_c_node,
+            next_c_time,
+            next_u_cap,
+            next_u_end,
+            next_t_dead,
+        )
+        deadline_slack = next_deadline - return_time
+        endurance_slack = float(self.agents_endurance[vehicle_id]) - (
+            next_endurance + back_time
+        )
+        min_slack = min(deadline_slack, endurance_slack, time_window_slack)
+
+        if self.env.target == "mincost":
+            target_secondary = self._candidate_added_cost(
+                vehicle_id=vehicle_id,
+                current_length=float(c_length[vehicle_id]),
+                distance_delta=distance_delta,
+                operating_delta=operating_delta,
+            )
+        else:
+            target_secondary = return_time
+            for other_vehicle in range(self.num_agents):
+                if other_vehicle != vehicle_id:
+                    target_secondary = max(target_secondary, float(c_time[other_vehicle]))
+
+        return (
+            -float(reachable_after),
+            -float(min_slack),
+            float(target_secondary),
+            float(return_time),
+            float(distance_delta),
+            float(service_time),
+        )
+
     def decode(self, chromosome: np.ndarray) -> DecodedSolution:
         """Hàm bọc ngoài để gọi _decode_cached với input có thể băm (hash) được."""
         key = tuple(int(x) for x in chromosome.tolist())
@@ -136,13 +335,18 @@ class BasicPVRPWDPSolver:
         routes = [[] for _ in range(self.num_agents)]
         unserved: list[int] = []
 
-        for customer_id in chromosome_tuple:
+        for customer_pos, customer_id in enumerate(chromosome_tuple):
             cust_idx = int(self.customer_env_indices[customer_id])
             demand = float(self.customer_demands[customer_id])
             earliest, latest = self.time_windows[customer_id]
             wait_limit = float(self.waiting_time[customer_id])
+            remaining_customer_ids = (
+                tuple(int(x) for x in chromosome_tuple[customer_pos + 1 :])
+                if self.rank_strategy == "serve-max"
+                else ()
+            )
 
-            best_rank = (math.inf, math.inf, math.inf)
+            best_rank: tuple[float, ...] | None = None
             best_update = None
             best_vehicle = -1
 
@@ -172,11 +376,31 @@ class BasicPVRPWDPSolver:
                             return_time <= new_deadline + 1e-9
                             and new_u_end + back_time <= endurance + 1e-9
                         ):
-                            rank = (return_time, travel_dist, service_time)
-                            if rank < best_rank:
+                            step_op = travel_time + wait_mid
+                            rank = self._candidate_rank(
+                                vehicle_id=v,
+                                service_time=service_time,
+                                return_time=return_time,
+                                distance_delta=travel_dist,
+                                operating_delta=step_op,
+                                back_time=back_time,
+                                next_node=cust_idx,
+                                next_time=service_time,
+                                next_capacity=u_cap[v] + demand,
+                                next_endurance=new_u_end,
+                                next_deadline=new_deadline,
+                                time_window_slack=float(latest) - service_time,
+                                remaining_customer_ids=remaining_customer_ids,
+                                c_node=c_node,
+                                c_time=c_time,
+                                c_length=c_length,
+                                u_cap=u_cap,
+                                u_end=u_end,
+                                t_dead=t_dead,
+                            )
+                            if best_rank is None or rank < best_rank:
                                 best_rank = rank
                                 best_vehicle = v
-                                step_op = travel_time + wait_mid
                                 best_update = (
                                     cust_idx,
                                     service_time,
@@ -213,15 +437,31 @@ class BasicPVRPWDPSolver:
                                 return_time_new <= new_deadline_new + 1e-9
                                 and new_u_end_new + back_time_new <= endurance + 1e-9
                             ):
-                                rank_new = (
-                                    return_time_new,
-                                    travel_dist_new,
-                                    service_time_new,
+                                step_op_new = travel_time_new
+                                rank_new = self._candidate_rank(
+                                    vehicle_id=v,
+                                    service_time=service_time_new,
+                                    return_time=return_time_new,
+                                    distance_delta=back_dist + travel_dist_new,
+                                    operating_delta=back_time_reset + step_op_new,
+                                    back_time=back_time_new,
+                                    next_node=cust_idx,
+                                    next_time=service_time_new,
+                                    next_capacity=demand,
+                                    next_endurance=new_u_end_new,
+                                    next_deadline=new_deadline_new,
+                                    time_window_slack=float(latest) - service_time_new,
+                                    remaining_customer_ids=remaining_customer_ids,
+                                    c_node=c_node,
+                                    c_time=c_time,
+                                    c_length=c_length,
+                                    u_cap=u_cap,
+                                    u_end=u_end,
+                                    t_dead=t_dead,
                                 )
-                                if rank_new < best_rank:
+                                if best_rank is None or rank_new < best_rank:
                                     best_rank = rank_new
                                     best_vehicle = v
-                                    step_op_new = travel_time_new  # Từ depot xuất phát nên ko tính thời gian chờ
                                     best_update = (
                                         cust_idx,
                                         service_time_new,
@@ -777,6 +1017,7 @@ def worker_run_single_instance(
     local_search_rate: float,
     local_search_elites: int,
     local_search_iters: int,
+    rank_strategy: str,
     seed: int,
     show_routes: bool,
     show_generation_progress: bool,
@@ -786,7 +1027,12 @@ def worker_run_single_instance(
     env, td_raw, td_reset = load_instance(npz_path, batch_idx, target)
     reference_cost = get_optional_batch_float(td_raw, 0, ("costs", "cost"))
     offset = get_optional_batch_int(td_raw, 0, ("offsets", "offset"))
-    solver = BasicPVRPWDPSolver(env=env, td_raw=td_raw, td_reset=td_reset)
+    solver = BasicPVRPWDPSolver(
+        env=env,
+        td_raw=td_raw,
+        td_reset=td_reset,
+        rank_strategy=rank_strategy,
+    )
 
     # Tắt hiển thị theo generation khi chạy song song để khỏi rác console
     best = solver.run(
@@ -842,6 +1088,7 @@ def run_target_over_dataset(
     local_search_rate: float,
     local_search_elites: int,
     local_search_iters: int,
+    rank_strategy: str,
     seed: int,
     output_dir: str | None,
     batch_idx: int | None,
@@ -861,7 +1108,9 @@ def run_target_over_dataset(
 
     offset_note = f", offset={offset}" if offset is not None else ""
     print(
-        f"\n=== Running target={target} on {len(batch_indices)}/{total_batches} instances{offset_note} (Workers: {max_workers}) ==="
+        f"\n=== Running target={target} rank_strategy={rank_strategy} "
+        f"on {len(batch_indices)}/{total_batches} instances{offset_note} "
+        f"(Workers: {max_workers}) ==="
     )
 
     # Thực thi song song
@@ -885,6 +1134,7 @@ def run_target_over_dataset(
                 local_search_rate,
                 local_search_elites,
                 local_search_iters,
+                rank_strategy,
                 instance_seed,
                 show_routes and len(batch_indices) == 1,
                 show_generation_progress,
@@ -944,7 +1194,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--num-batches",
         type=int,
-        default=1,
+        default=None,
         help="Run only the first N selected batches.",
     )
     parser.add_argument(
@@ -956,8 +1206,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--target", choices=["makespan", "mincost", "both"], default="both"
     )
-    parser.add_argument("--population", type=int, default=100)
-    parser.add_argument("--generations", type=int, default=400)
+    parser.add_argument("--population", type=int, default=50)
+    parser.add_argument("--generations", type=int, default=100)
     parser.add_argument("--mutation-rate", type=float, default=0.2)
     parser.add_argument("--elite-size", type=int, default=4)
     parser.add_argument("--tournament-size", type=int, default=5)
@@ -966,6 +1216,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--local-search-rate", type=float, default=0.2)
     parser.add_argument("--local-search-elites", type=int, default=2)
     parser.add_argument("--local-search-iters", type=int, default=20)
+    parser.add_argument(
+        "--rank-strategy",
+        choices=BasicPVRPWDPSolver.RANK_STRATEGIES,
+        default="legacy",
+        help=(
+            "Vehicle-choice rank used by the greedy decoder. "
+            "'legacy' keeps (return_time, distance, service_time); "
+            "'serve-max' prioritizes preserving reachability for remaining customers."
+        ),
+    )
     parser.add_argument("--show-generation-progress", action="store_true")
     parser.add_argument("--generation-progress-every", type=int, default=100)
     parser.add_argument("--seed", type=int, default=42)
@@ -999,6 +1259,7 @@ def main() -> None:
             local_search_rate=args.local_search_rate,
             local_search_elites=args.local_search_elites,
             local_search_iters=args.local_search_iters,
+            rank_strategy=args.rank_strategy,
             seed=args.seed,
             output_dir=args.output_dir,
             batch_idx=args.batch_idx,
@@ -1024,4 +1285,5 @@ def main() -> None:
 if __name__ == "__main__":
     main()
 
-# uv run python ga_pvrpwdp.py --npz D:\k0d3\DATN\parco\test_data\test.npz --offset 1 --num-batches 10 --target makespan --population 100 --generations 400 --show-generation-progress --generation-progress-every 100 
+# uv run python ga_pvrpwdp.py --npz D:\k0d3\DATN\parco\test_data\test.npz --offset 1 --num-batches 10 --target makespan --population 100 --generations 400 --show-generation-progress --generation-progress-every 100
+# uv run python ga_pvrpwdp.py --npz D:\k0d3\DATN\parco\test_data\test.npz  --show-generation-progress --generation-progress-every 100

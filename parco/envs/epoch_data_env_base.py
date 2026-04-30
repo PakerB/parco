@@ -54,11 +54,8 @@ class MultiPartLazyDataset(torch.utils.data.Dataset):
         # Shard per part so all DDP ranks load the same part file at the same time.
         self.local_length = self.samples_per_file // self.world_size
         self.total_samples = len(self.part_files) * self.local_length
-
         self.current_part_idx = -1
         self.current_td = None
-        # Cache các item đã "tháo" thành dict cho part đang nạp để
-        # tương thích định dạng với rl4co.data.dataset.TensorDictDataset
         self._current_items = None
 
     def __len__(self):
@@ -74,8 +71,6 @@ class MultiPartLazyDataset(torch.utils.data.Dataset):
         )
         td = load_npz_to_tensordict(file_path)
         self.current_td = td
-        # Disassemble TensorDict -> list[dict[str, Tensor]] giống TensorDictDataset
-        # để collate_fn hoạt động đúng với rl4co._dataloader_single.
         n = td.batch_size[0]
         self._current_items = [
             {key: value[i] for key, value in td.items()} for i in range(n)
@@ -97,13 +92,6 @@ class MultiPartLazyDataset(torch.utils.data.Dataset):
 
     @staticmethod
     def collate_fn(batch):
-        """Collate list of dicts thành một TensorDict batched.
-
-        Sao chép hành vi của `rl4co.data.dataset.TensorDictDataset.collate_fn`
-        để tương thích với `rl4co.models.rl.common.base._dataloader_single`.
-        """
-        # Trường hợp hiếm: nếu item là TensorDict (khi __getitem__ bị override),
-        # dùng torch.stack trực tiếp.
         if isinstance(batch[0], TensorDict):
             return torch.stack(batch, dim=0)
         return TensorDict(
@@ -162,7 +150,6 @@ class EpochDataEnvBase(RL4COEnvBase):
             error_msg = f"❌ LỖI CHÍ MẠNG: Không tìm thấy bất kỳ file nào cho Epoch {self.current_epoch} với định dạng '{search_pattern}'"
             log.error(error_msg)
             raise FileNotFoundError(error_msg)
-
         # Detect samples per file from the first part
         first_td = load_npz_to_tensordict(part_files[0])
         SAMPLES_PER_FILE = len(first_td)

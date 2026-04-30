@@ -1552,7 +1552,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--npz", required=True, help="Path to NPZ file.")
     parser.add_argument("--batch-idx", type=int, default=None)
-    parser.add_argument("--num-batches", type=int, default=1)
+    parser.add_argument("--num-batches", type=int, default=None)
     parser.add_argument(
         "--offset",
         type=int,
@@ -1627,4 +1627,4 @@ def main() -> None:
 if __name__ == "__main__":
     main()
     
-# uv run python ga_pvrpwdp_hgs_split.py --npz data/test_data/test.npz --num-batches 10  --target makespan --mu 14 --lambda-size 16 --max-iters 500 --max-workers 1 --show-routes --show-generation-progress --offset 2
+# uv run python ga_pvrpwdp_hgs_split.py --npz data/test_data/test.npz  --target both --mu 14 --lambda-size 16 --max-iters 500 --show-routes --show-generation-progress

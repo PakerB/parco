@@ -116,8 +116,9 @@ Reward is negative cost.
 
 For `target="makespan"` in the current code:
 
-- Cost currently uses unvisited ratio only.
-- If makespan is reintroduced, keep feasibility as priority 1.
+- Cost uses adaptive big-M unvisited penalty plus makespan.
+- Adaptive big-M must exceed any possible makespan for that instance so
+  feasibility remains priority 1.
 
 For `target="mincost"`:
 
@@ -169,4 +170,3 @@ When editing env physics, update GA logic at the same time:
 - Truck/drone cost split.
 - Adaptive unserved penalty.
 - Env replay through `evaluate_with_env`.
-
