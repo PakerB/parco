@@ -5,7 +5,7 @@ from rl4co.models.nn.env_embeddings.dynamic import StaticEmbedding
 from .hcvrp import HCVRPContextEmbedding, HCVRPInitEmbedding
 from .omdcpdp import OMDCPDPContextEmbedding, OMDCPDPInitEmbedding
 from .ffsp import FFSPInitEmbeddings, FFSPDynamicEmbedding, FFSPContextEmbedding
-from .pvrpwdp import PVRPWDPContextEmbedding, PVRPWDPInitEmbedding
+from .pvrpwdp import PVRPWDPContextEmbedding, PVRPWDPInitEmbedding, PVRPWDPDynamicEmbedding
 
 def env_embedding_register(
     env_name: str, config: dict, registry_default: dict, registry_custom: dict = None
@@ -59,7 +59,7 @@ def env_dynamic_embedding(
         "omdcpdp": StaticEmbedding,
         "hcvrp": StaticEmbedding,
         "ffsp": FFSPDynamicEmbedding,
-        "pvrpwdp": StaticEmbedding
+        "pvrpwdp": PVRPWDPDynamicEmbedding
     }
     # if not in key, just return static embedding
     if env_name not in emb_registry.keys():

@@ -11,6 +11,7 @@ from tensordict import TensorDict
 from torch import Tensor
 
 from .env_embeddings import env_context_embedding, env_dynamic_embedding
+from .nn.attention_injection import MLPAttentionInjection, ProjectedAdditiveInjection
 
 log = get_pylogger(__name__)
 
@@ -27,6 +28,7 @@ class PARCODecoder(AttentionModelDecoder):
         dynamic_embedding_kwargs: dict = {},
         use_graph_context: bool = False,
         use_pos_token: bool = False,
+        attention_injection_mode: str = "none",
         **kwargs,
     ):
         self.use_pos_token = use_pos_token
@@ -50,6 +52,15 @@ class PARCODecoder(AttentionModelDecoder):
             use_graph_context=use_graph_context,
             **kwargs,
         )
+        
+        # Attention injection
+        self.attention_injection_mode = attention_injection_mode
+        if attention_injection_mode == "mlp":
+            self.attention_injection = MLPAttentionInjection(num_heads=num_heads)
+        elif attention_injection_mode == "projected":
+            self.attention_injection = ProjectedAdditiveInjection()
+        else:
+            self.attention_injection = None
 
     def forward(
         self,
@@ -90,6 +101,10 @@ class PARCODecoder(AttentionModelDecoder):
 
         # Compute logits
         logits = self.pointer(glimpse_q, glimpse_k, glimpse_v, logit_k, mask)
+        
+        # Apply attention injection if configured
+        if self.attention_injection is not None and "time_scaler" in td.keys():
+            logits = self.attention_injection(logits, td, td["time_scaler"])
 
         # For passing to the next step commnuication layer, reshape logits and mask to [B*S, m, N] if num_starts > 1
         if num_starts > 1:

@@ -1,5 +1,7 @@
 from random import randint
 from typing import Any
+from datetime import datetime
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -67,6 +69,33 @@ class PARCORLModule(SymNCO):
         self.val_test_num_agents = val_test_num_agents
         self.allow_multi_dataloaders = allow_multi_dataloaders
         self.use_padding_mode = use_padding_mode  # ✅ NEW: Enable padding mode with metadata
+        
+        # ✅ NEW: Setup file for logging batch rewards during validation
+        self.val_rewards_file = Path("val_batch_rewards.txt")
+        self.val_rewards_file.parent.mkdir(parents=True, exist_ok=True)
+
+    def _log_batch_rewards(self, td, reward):
+        """Log all batch rewards to txt file during validation"""
+        try:
+            # Get reward from td (tensor) or use passed reward
+            if hasattr(td, "reward"):
+                batch_reward = td.reward.cpu().numpy()
+            else:
+                batch_reward = reward.mean(dim=-1).cpu().detach().numpy() if isinstance(reward, torch.Tensor) else reward
+            
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            epoch = self.current_epoch if hasattr(self, "current_epoch") else 0
+            
+            with open(self.val_rewards_file, "a") as f:
+                f.write(f"\n{'='*60}\n")
+                f.write(f"Epoch: {epoch} | Time: {timestamp}\n")
+                f.write(f"{'='*60}\n")
+                f.write(f"Batch Size: {len(batch_reward)}\n")
+                f.write(f"Batch Rewards: {batch_reward}\n")
+                f.write(f"Mean: {batch_reward.mean():.6f} | Std: {batch_reward.std():.6f}\n")
+                f.write(f"Min: {batch_reward.min():.6f} | Max: {batch_reward.max():.6f}\n")
+        except Exception as e:
+            log.error(f"Failed to log batch rewards: {e}")
 
     def shared_step(
         self, batch: Any, batch_idx: int, phase: str, dataloader_idx: int = None
@@ -174,6 +203,10 @@ class PARCORLModule(SymNCO):
                     "loss_inv": loss_inv,
                 }
             )
+
+        # ✅ NEW: Log batch rewards to file for validation
+        if phase == "val":
+            self._log_batch_rewards(td, reward)
 
         metrics = self.log_metrics(out, phase, dataloader_idx=dataloader_idx)
         return {"loss": out.get("loss", None), **metrics}

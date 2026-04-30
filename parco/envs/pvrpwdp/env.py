@@ -174,14 +174,7 @@ class PVRPWDPVEnv(EpochDataEnvBase):
         demand_depot = torch.zeros(
             (*batch_size, num_agents), dtype=torch.float32, device=device
         )
-        # demand = torch.cat((demand_depot, td["demand"]), -1)
-
-        # # Repeat the demand for each agent, for convinent action mask calculation
-        # # Note that this will take more memory
-        # demand = demand.unsqueeze(-2).repeat(1, num_agents, 1)
-        demand_depot = torch.zeros((*batch_size, num_agents), dtype=torch.float32, device=device)
-        demand = torch.cat((demand_depot, td["demand"]), -1)
-        
+        demand = torch.cat((demand_depot, td["demand"]), -1)  # [B, M+N] (NOT repeated per agent)
         speeds = td["agents_speed"]
         speed_min = speeds.min(dim=-1, keepdim=True)[0]  # [B, 1]
         
@@ -228,15 +221,35 @@ class PVRPWDPVEnv(EpochDataEnvBase):
         visited = torch.zeros((*batch_size, num_loc_all), dtype=torch.bool, device=device)
 
         # Init action mask
+        # Start with all customers open, but only each agent's own depot open
         action_mask = torch.ones(
             (*batch_size, num_agents, num_loc_all), dtype=torch.bool, device=device
         )
+        # Agent i can only visit depot i, not other depots
+        depot_eye = torch.eye(num_agents, dtype=torch.bool, device=device)
+        action_mask[..., :num_agents] = depot_eye.unsqueeze(0).expand(*batch_size, -1, -1)
+
+        # === Pre-compute static tensors (do not change between steps) ===
+        all_locs = torch.cat((depots, td["locs"]), -2)  # [B, M+N, 2]
+        
+        # Inter-customer distance matrix (for future_slack / reachability)
+        customer_locs_final = all_locs[:, num_agents:, :]  # [B, N, 2]
+        inter_customer_dist = torch.cdist(customer_locs_final, customer_locs_final)  # [B, N, N]
+        
+        # Distance from each depot to all nodes (for get_action_mask)
+        depot_locs_final = all_locs[:, :num_agents, :]  # [B, M, 2]
+        dist_to_depot_static = torch.cdist(depot_locs_final, all_locs)  # [B, M, M+N]
+        
+        # Eye mask for depot isolation logic
+        depot_eye_mask = torch.eye(num_agents, device=device).bool()
+        depot_eye_mask = depot_eye_mask[None, ...].expand(*batch_size, -1, -1)  # [B, M, M]
+        
 
         # Create reset TensorDict
         td_reset = TensorDict(
             {
-                "locs": torch.cat((depots, td["locs"]), -2),
-                "demand": demand,
+                "locs": all_locs,
+                "demand": demand,  # [B, M+N]
                 "time_window": time_window,  # [B, m+N, 2]
                 "waiting_time": waiting_time,  # [B, m+N]
                 "current_length": torch.zeros(
@@ -259,11 +272,16 @@ class PVRPWDPVEnv(EpochDataEnvBase):
                 "visited": visited,
                 "action_mask": action_mask,
                 "done": torch.zeros((*batch_size,), dtype=torch.bool, device=device),
+                # === Cached static tensors ===
+                "inter_customer_dist": inter_customer_dist,  # [B, N, N]
+                "dist_to_depot_static": dist_to_depot_static,  # [B, M, M+N]
+                "depot_eye_mask": depot_eye_mask,  # [B, M, M]
             },
             batch_size=batch_size,
             device=device,
         )
         td_reset.set("action_mask", self.get_action_mask(td_reset))
+        self._cache_heuristic_features(td_reset)
         return td_reset
 
     def _step(self, td: TensorDict) -> TensorDict:
@@ -381,6 +399,7 @@ class PVRPWDPVEnv(EpochDataEnvBase):
             }
         )
         td.set("action_mask", self.get_action_mask(td))
+        self._cache_heuristic_features(td)
 
         # === Impossibility Detection ===
         # Check if all agents are at depot with no valid customer action
@@ -530,6 +549,148 @@ class PVRPWDPVEnv(EpochDataEnvBase):
         
         return impossible
     
+    def _cache_heuristic_features(self, td):
+        """Compute and cache heuristic features into td for dynamic embedding.
+        
+        Caches: slack_matrix, min_future_slack, reachability_loss, num_reachable.
+        Uses loop-over-agents to keep VRAM usage at O(B*N*N) instead of O(B*M*N*N).
+        """
+        num_agents = td["current_node"].size(-1)
+        B = td.batch_size[0] if isinstance(td.batch_size, (list, tuple)) else td.batch_size
+        N_total = td["locs"].size(-2)  # M+N
+        N = N_total - num_agents  # customer count
+        device = td.device
+        
+        # --- 1. Slack matrix [B, M, M+N] ---
+        # Recompute ready_time (service_time in get_action_mask)
+        current_locs = gather_by_index(td["locs"], td["current_node"])  # [B, M, 2]
+        all_locs = td["locs"]  # [B, M+N, 2]
+        dist_to_nodes = torch.cdist(current_locs, all_locs)  # [B, M, M+N]
+        travel_time_to_nodes = dist_to_nodes / td["agents_speed"].unsqueeze(-1)  # [B, M, M+N]
+        arrival_time = td["current_time"].unsqueeze(-1) + travel_time_to_nodes  # [B, M, M+N]
+        earliest_times = td["time_window"][..., 0].unsqueeze(-2)  # [B, 1, M+N]
+        latest_times = td["time_window"][..., 1].unsqueeze(-2)  # [B, 1, M+N]
+        ready_time = torch.maximum(arrival_time, earliest_times)  # [B, M, M+N]
+        
+        slack_matrix = latest_times - ready_time  # [B, M, M+N]
+        # Mask unreachable nodes to 0
+        action_mask = td["action_mask"]  # [B, M, M+N]
+        slack_matrix = slack_matrix * action_mask.float()
+        
+        # --- 2. num_reachable [B, N] ---
+        customer_mask = action_mask[..., num_agents:]  # [B, M, N]
+        num_reachable = customer_mask.float().sum(dim=-2)  # [B, N] sum over agents
+        
+        # --- 3. future_slack [B, M, N] and reachability_loss [B, M, N] ---
+        # Loop over agents to avoid [B, M, N, N] tensors
+        min_future_slack = torch.zeros(B, num_agents, N, device=device)
+        reachability_loss = torch.zeros(B, num_agents, N, device=device)
+        
+        inter_dist = td["inter_customer_dist"]  # [B, N, N] (cached in _reset)
+        unvisited = ~td["visited"][..., num_agents:]  # [B, N]
+        customer_demand = td["demand"][..., num_agents:]  # [B, N]
+        
+        # loss_weight[j] = 1 / num_reachable[j], for normalization
+        loss_weight = 1.0 / num_reachable.clamp(min=1e-6)  # [B, N]
+        
+        for k in range(num_agents):
+            speed_k = td["agents_speed"][:, k:k+1]  # [B, 1]
+            reachable_k = customer_mask[:, k, :]  # [B, N] - what agent k can reach NOW
+            
+            # Skip if this agent can't reach any customer
+            if not reachable_k.any():
+                continue
+            
+            # ready_time for agent k at each customer node
+            ready_time_k = ready_time[:, k, num_agents:]  # [B, N]
+            
+            # Travel time from customer i to customer j for agent k
+            inter_travel_time = inter_dist / speed_k.unsqueeze(-1)  # [B, N, N]
+            
+            # Arrival at j after visiting i: ready_time[k,i] + travel(i→j)
+            arrival_at_j = ready_time_k.unsqueeze(-1) + inter_travel_time  # [B, N, N]
+            
+            # --- future_slack[k,i,j] = latest_j - arrival_at_j ---
+            latest_customers = td["time_window"][..., num_agents:, 1]  # [B, N]
+            fs_k = latest_customers.unsqueeze(-2) - arrival_at_j  # [B, N, N]
+            
+            # Mask: only consider unvisited j, exclude j==i
+            j_mask = unvisited.unsqueeze(-2).expand_as(fs_k)  # [B, N, N]
+            diag_mask = ~torch.eye(N, device=device, dtype=torch.bool).unsqueeze(0)  # [1, N, N]
+            valid_j = j_mask & diag_mask  # [B, N, N]
+            
+            # Min future slack (only over valid j)
+            fs_k_masked = fs_k.masked_fill(~valid_j, float('inf'))
+            min_fs_k = fs_k_masked.min(dim=-1)[0]  # [B, N]
+            # If no valid j, set to 0
+            no_valid_j = ~valid_j.any(dim=-1)  # [B, N]
+            min_fs_k = min_fs_k.masked_fill(no_valid_j, 0.0)
+            # Only store for reachable source nodes i
+            min_future_slack[:, k, :] = min_fs_k * reachable_k.float()
+            
+            # --- Reachability loss: 3-constraint feasibility check ---
+            # TIME check
+            time_ok = arrival_at_j <= latest_customers.unsqueeze(-2)  # [B, N, N]
+            
+            # ENDURANCE check
+            is_at_depot_k = td["current_node"][:, k] < num_agents  # [B]
+            # Endurance to node i
+            endurance_to_i = travel_time_to_nodes[:, k, num_agents:]  # [B, N]
+            wait_at_i = torch.clamp(
+                td["time_window"][..., num_agents:, 0] - arrival_time[:, k, num_agents:], min=0.0
+            )  # [B, N]
+            endurance_to_i_mid = endurance_to_i + wait_at_i  # mid-trip
+            endurance_to_i_depot = endurance_to_i  # from depot (no wait)
+            endurance_to_i_actual = torch.where(
+                is_at_depot_k.unsqueeze(-1), endurance_to_i_depot, endurance_to_i_mid
+            )  # [B, N]
+            
+            # Wait at j after coming from i
+            earliest_j = td["time_window"][..., num_agents:, 0].unsqueeze(-2)  # [B, 1, N]
+            wait_at_j = torch.clamp(earliest_j - arrival_at_j, min=0.0)  # [B, N, N]
+            
+            # Travel from j back to depot k (use cached dist_to_depot_static)
+            dist_j_depot = td["dist_to_depot_static"][:, k, num_agents:]  # [B, N]
+            travel_j_depot = dist_j_depot / speed_k  # [B, N]
+            
+            total_endurance = (
+                td["used_endurance"][:, k:k+1].unsqueeze(-1)  # [B, 1, 1]
+                + endurance_to_i_actual.unsqueeze(-1)  # [B, N, 1]
+                + inter_travel_time  # [B, N, N]  (i→j)
+                + wait_at_j  # [B, N, N]
+                + travel_j_depot.unsqueeze(-2)  # [B, 1, N]  (j→depot)
+            )  # [B, N, N]
+            endurance_ok = total_endurance <= td["agents_endurance"][:, k:k+1].unsqueeze(-1)  # [B, N, N]
+            
+            # CAPACITY check: remaining_cap - demand[i] >= demand[j]
+            remain_cap_k = td["agents_capacity"][:, k] - td["used_capacity"][:, k]  # [B]
+            cap_after_i = remain_cap_k.unsqueeze(-1) - customer_demand  # [B, N] (remaining after pickup i)
+            capacity_ok = cap_after_i.unsqueeze(-1) >= customer_demand.unsqueeze(-2)  # [B, N, N]
+            
+            # Combined feasibility
+            feasible = time_ok & endurance_ok & capacity_ok  # [B, N, N]
+            
+            # k_loses_j: currently reachable but not feasible after visiting i
+            k_reaches_now = reachable_k  # [B, N]
+            k_loses = k_reaches_now.unsqueeze(-2) & ~feasible  # [B, N, N]
+            # Only count losses for valid j (unvisited, j!=i)
+            k_loses = k_loses & valid_j
+            
+            # Weighted loss: sum_j(k_loses × 1/num_reachable[j]) / total_weight_k
+            weighted_losses = (k_loses.float() * loss_weight.unsqueeze(-2)).sum(dim=-1)  # [B, N]
+            total_weight_k = (reachable_k.float() * loss_weight).sum(dim=-1, keepdim=True).clamp(min=1e-6)  # [B, 1]
+            r_loss_k = weighted_losses / total_weight_k  # [B, N]
+            # Only store for reachable source nodes i
+            reachability_loss[:, k, :] = r_loss_k * reachable_k.float()
+        
+        # Cache into td
+        td.update({
+            "slack_matrix": slack_matrix,  # [B, M, M+N]
+            "min_future_slack": min_future_slack,  # [B, M, N]
+            "reachability_loss": reachability_loss,  # [B, M, N]
+            "num_reachable": num_reachable,  # [B, N]
+        })
+
     def _get_reward(self, td: TensorDict, actions: torch.Tensor) -> torch.Tensor:
         """
         Compute reward for PVRPWDP.
@@ -570,7 +731,7 @@ class PVRPWDPVEnv(EpochDataEnvBase):
         # Reward = -cost
         
         if self.target == "makespan":
-            cost = unvisited_ratio
+            cost = unvisited_ratio  # ✅ Giữ lại ratio
         elif self.target == "mincost":
             is_truck = self._truck_mask_from_capacity(td["agents_capacity"])
             travel_vec = (
@@ -614,6 +775,15 @@ class PVRPWDPVEnv(EpochDataEnvBase):
             cost = lambda_u * unvisited_count + travel_part + rent_part
         else:
             raise NotImplementedError(f"Invalid target: {self.target}")
+        
+        # DEBUG: In ra thông tin
+        if hasattr(self, '_debug_printed') == False:
+            log.info(f"🔍 DEBUG: target={self.target}, cost shape={cost.shape if hasattr(cost, 'shape') else 'scalar'}")
+            log.info(f"   unvisited_count={unvisited_count[0] if len(unvisited_count) > 0 else 0}")
+            log.info(f"   unvisited_ratio={unvisited_ratio[0] if len(unvisited_ratio) > 0 else 0}")
+            log.info(f"   num_customers={num_customers}, num_agents={num_agents}")
+            self._debug_printed = True
+        
         return -cost
 
     @staticmethod
@@ -630,9 +800,8 @@ class PVRPWDPVEnv(EpochDataEnvBase):
         # remain_capacity = td["agents_capacity"] - td["used_capacity"]
         # within_capacity_flag = td["demand"] <= remain_capacity[..., None]  # TODO: check
         remain_capacity = td["agents_capacity"] - td["used_capacity"]
-        
-        # Thêm unsqueeze(-2) cho demand và unsqueeze(-1) cho remain_capacity
-        within_capacity_flag = td["demand"].unsqueeze(-2) <= remain_capacity.unsqueeze(-1)
+        # demand is [B, M+N], broadcast over agents via unsqueeze
+        within_capacity_flag = td["demand"].unsqueeze(-2) <= remain_capacity[..., None]  # [B, M, M+N]
         action_mask &= within_capacity_flag
 
         # === PVRPWDP-specific constraints: Time window and deadline ===
@@ -698,11 +867,15 @@ class PVRPWDPVEnv(EpochDataEnvBase):
         # For each agent i, calculate distance from each node to depot i
         # all_locs [B, m+N, 2], depot_locs [B, m, 2]
         # We need [B, m, m+N] where [b, i, j] = distance from node j to depot i
-        dist_to_depot = torch.cdist(
-            depot_locs,  # [B, m, 2]
-            all_locs,    # [B, m+N, 2]
-            p=2
-        )  # [B, m, m+N]
+        # Use cached dist_to_depot if available, otherwise compute
+        if "dist_to_depot_static" in td.keys():
+            dist_to_depot = td["dist_to_depot_static"]  # [B, M, M+N]
+        else:
+            dist_to_depot = torch.cdist(
+                depot_locs,  # [B, m, 2]
+                all_locs,    # [B, m+N, 2]
+                p=2
+            )  # [B, m, m+N]
         
         # Calculate travel time from each node back to depot [B, m, m+N]
         travel_time_to_depot = dist_to_depot / td["agents_speed"].unsqueeze(-1)
@@ -723,7 +896,7 @@ class PVRPWDPVEnv(EpochDataEnvBase):
         # Calculate endurance needed: travel to node + waiting (if early & not from depot) + return to depot
         # For agents at depot: waiting_time is 0 (can optimize departure)
         # For agents mid-trip: waiting_time is counted (must wait if early)
-        endurance_to_node = travel_time_to_nodes.clone()  # [B, m, m+N]
+        endurance_to_node = travel_time_to_nodes  # [B, m, m+N] (no clone needed, overwritten by where)
         
         # Add waiting time only if NOT at depot (same logic as in _step)
         endurance_to_node = torch.where(
@@ -788,8 +961,12 @@ class PVRPWDPVEnv(EpochDataEnvBase):
         depot_mask |= all_visited_flag
 
         # Update the depot mask in the action mask
-        eye_matrix = torch.eye(num_agents, device=td.device)
-        eye_matrix = eye_matrix[None, ...].repeat(*batch_size, 1, 1).bool()
+        # Use cached eye mask if available
+        if "depot_eye_mask" in td.keys():
+            eye_matrix = td["depot_eye_mask"].clone()  # clone: will be modified in-place below
+        else:
+            eye_matrix = torch.eye(num_agents, device=td.device)
+            eye_matrix = eye_matrix[None, ...].repeat(*batch_size, 1, 1).bool()
         eye_matrix &= depot_mask[..., None]
         action_mask[..., :num_agents] = eye_matrix
 
