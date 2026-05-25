@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 
 from rl4co.utils.ops import gather_by_index
+from rl4co.models.nn.attention import MultiHeadAttention
 
 from parco.models.nn.positional_encoder import PositionalEncoder
 
